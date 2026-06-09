@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
-	metainfo "torrent-demo/internal/metainfo"
+	"torrent-demo/internal/metainfo"
+	"torrent-demo/internal/tracker_client"
 )
 
 func usage() {
@@ -44,7 +46,7 @@ func run() error {
 		}
 	}
 
-	switch info := meta.Info.(type) {
+	switch info := meta.Info.Info.(type) {
 	case metainfo.SingleFileInfo:
 		fmt.Printf("Mode:         single-file\n")
 		fmt.Printf("Name:         %s\n", info.Name)
@@ -61,5 +63,74 @@ func run() error {
 		}
 	}
 
+	// collect all HTTP trackers
+	var trackers []string
+	if strings.HasPrefix(meta.Announce, "http") {
+		trackers = append(trackers, meta.Announce)
+	}
+	for _, tier := range meta.AnnounceList {
+		for _, url := range tier {
+			if strings.HasPrefix(url, "http") {
+				trackers = append(trackers, url)
+			}
+		}
+	}
+
+	if len(trackers) == 0 {
+		fmt.Println("No HTTP trackers found")
+		return nil
+	}
+
+	var peerID [20]byte
+	copy(peerID[:], "-TD0001-123456789012")
+
+	req := tracker_client.AnnounceRequest{
+		InfoHash: meta.InfoHash,
+		PeerID:   peerID,
+		Port:     6881,
+		Compact:  1,
+		Event:    tracker_client.EventStarted,
+	}
+
+	fmt.Printf("\nAnnouncing to %d HTTP tracker(s)...\n", len(trackers))
+	type result struct {
+		Tracker string
+		Resp    *tracker_client.AnnounceResponse
+	}
+	ch := make(chan result, len(trackers))
+	for _, url := range trackers {
+		url := url
+		go func() {
+			fmt.Printf("\n[%s]\n", url)
+			c, err := tracker_client.NewTrackerClient(url)
+			if err != nil {
+				fmt.Printf("  error: %v\n", err)
+				return
+			}
+			resp, err := c.Announce(context.Background(), req)
+			if err != nil {
+				fmt.Printf("  error: %v\n", err)
+				return
+			}
+
+			ch <- result{
+				Tracker: url,
+				Resp:    resp,
+			}
+		}()
+	}
+
+	for range trackers {
+		res := <-ch
+		resp := res.Resp
+		fmt.Printf("\nAnswer from %s\n", res.Tracker)
+		fmt.Printf("  interval:   %d\n", resp.Interval)
+		fmt.Printf("  complete:   %d\n", resp.Complete)
+		fmt.Printf("  incomplete: %d\n", resp.Incomplete)
+		fmt.Printf("  peers:      %d\n", len(resp.Peers.Peers))
+		for _, p := range resp.Peers.Peers {
+			fmt.Printf("    %s:%d\n", p.Ip, p.Port)
+		}
+	}
 	return nil
 }

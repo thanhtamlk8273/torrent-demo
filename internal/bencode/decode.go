@@ -3,6 +3,7 @@ package bencode
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"unicode"
 )
@@ -10,6 +11,22 @@ import (
 var ErrMalformed = errors.New("malformed bencode")
 
 type ParseFuncType func(*PacketParser) (any, error)
+
+type Unmarshaler interface {
+	UnmarshalBencode(data any) error
+}
+
+func FillDecoded(data any, v any) error {
+	return fill(data, v)
+}
+
+func Unmarshal(data []byte, v any) error {
+	decoded, err := Decode(data)
+	if err != nil {
+		return err
+	}
+	return fill(decoded, v)
+}
 
 func Decode(data []byte) (any, error) {
 	p := &PacketParser{data: data}
@@ -69,7 +86,7 @@ func ParseList(parser *PacketParser) (any, error) {
 
 	var ret []any
 	for nextChar := parser.Peek(); nextChar != nil && *nextChar != 'e'; nextChar = parser.Peek() {
-		val, err := getParseFunc(*nextChar)(parser)
+		val, err := parseElement(parser)
 		if err != nil {
 			return nil, err
 		}
@@ -143,4 +160,84 @@ func getParseFunc(ch byte) ParseFuncType {
 	default:
 		return nil
 	}
+}
+
+func fill(data any, dest any) error {
+	v := reflect.ValueOf(dest)
+
+	if v.Kind() != reflect.Ptr {
+		return fmt.Errorf("dest must be a pointer")
+	}
+
+	v = v.Elem()
+
+	if u, ok := dest.(Unmarshaler); ok {
+		return u.UnmarshalBencode(data)
+	}
+
+	switch v.Kind() {
+	case reflect.Int:
+		n, ok := data.(int)
+		if !ok {
+			return fmt.Errorf("expected int, got %T", data)
+		}
+		v.SetInt(int64(n))
+	case reflect.String:
+		s, ok := data.(string)
+		if !ok {
+			return fmt.Errorf("expected string, got %T", data)
+		}
+		v.SetString(s)
+	case reflect.Slice:
+		// Bencode has no binary type — raw bytes are encoded as strings.
+		// []byte destinations must accept a string from Decode instead of []any.
+		if v.Type() == reflect.TypeOf([]byte{}) {
+			s, ok := data.(string)
+			if !ok {
+				return fmt.Errorf("expected string for []byte, got %T", data)
+			}
+			v.Set(reflect.ValueOf([]byte(s)))
+			break
+		}
+		l, ok := data.([]any)
+		if !ok {
+			return fmt.Errorf("expected list, got %T", data)
+		}
+		for _, item := range l {
+			elem := reflect.New(v.Type().Elem())
+			if err := fill(item, elem.Interface()); err != nil {
+				return err
+			}
+			v.Set(reflect.Append(v, elem.Elem()))
+		}
+
+	case reflect.Struct:
+		m, ok := data.(map[string]any)
+		if !ok {
+			return fmt.Errorf("expected map, got %T", data)
+		}
+		for i := range v.NumField() {
+			tag := v.Type().Field(i).Tag.Get("bencode")
+			field := v.Type().Field(i)
+			if tag == "" {
+				if field.Anonymous {
+					if err := fill(data, v.Field(i).Addr().Interface()); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			bencodeVal, ok := m[tag]
+			if !ok {
+				continue
+			}
+			if err := fill(bencodeVal, v.Field(i).Addr().Interface()); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("Unsupported type")
+	}
+
+	return nil
 }

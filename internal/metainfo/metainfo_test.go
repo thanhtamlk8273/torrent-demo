@@ -1,4 +1,4 @@
-package metadatafile_test
+package metainfo_test
 
 import (
 	"testing"
@@ -15,7 +15,7 @@ func TestNewMetaInfo_MultiFile(t *testing.T) {
 		t.Error("expected announce to be set")
 	}
 
-	info, ok := meta.Info.(metainfo.MultiFileInfo)
+	info, ok := meta.Info.Info.(metainfo.MultiFileInfo)
 	if !ok {
 		t.Fatal("expected multi-file torrent")
 	}
@@ -43,6 +43,65 @@ func TestNewMetaInfo_MultiFile(t *testing.T) {
 		if len(f.Path) == 0 {
 			t.Error("expected file path to be set")
 		}
+	}
+}
+
+func TestNewMetaInfo_InfoHash(t *testing.T) {
+	meta, err := metainfo.NewMetaInfo("testdata/rdr.torrent")
+	if err != nil {
+		t.Fatalf("failed to parse: %v", err)
+	}
+
+	want := [20]byte{0xbb, 0x87, 0xcf, 0xc7, 0x79, 0x92, 0x11, 0x42, 0xe6, 0x1b,
+		0x97, 0x68, 0x23, 0x4c, 0x14, 0x96, 0x4c, 0x0e, 0x2f, 0xc3}
+	if meta.InfoHash != want {
+		t.Errorf("info hash = %x, want %x", meta.InfoHash, want)
+	}
+}
+
+// --- InfoField.UnmarshalBencode ---
+
+func TestInfoField_UnmarshalBencode_SelectsSingleFile(t *testing.T) {
+	data := map[string]any{
+		"piece length": 512,
+		"pieces":       "xxxx",
+		"name":         "myfile.txt",
+		"length":       1024,
+	}
+	var f metainfo.InfoField
+	if err := f.UnmarshalBencode(data); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := f.Info.(metainfo.SingleFileInfo); !ok {
+		t.Fatalf("expected SingleFileInfo, got %T", f.Info)
+	}
+}
+
+func TestInfoField_UnmarshalBencode_SelectsMultiFile(t *testing.T) {
+	data := map[string]any{
+		"piece length": 512,
+		"pieces":       "xxxx",
+		"name":         "mydir",
+		"files": []any{
+			map[string]any{
+				"length": 100,
+				"path":   []any{"subdir", "file.txt"},
+			},
+		},
+	}
+	var f metainfo.InfoField
+	if err := f.UnmarshalBencode(data); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := f.Info.(metainfo.MultiFileInfo); !ok {
+		t.Fatalf("expected MultiFileInfo, got %T", f.Info)
+	}
+}
+
+func TestInfoField_UnmarshalBencode_NotDict(t *testing.T) {
+	var f metainfo.InfoField
+	if err := f.UnmarshalBencode("not a dict"); err == nil {
+		t.Fatal("expected error for non-dict input")
 	}
 }
 

@@ -280,6 +280,134 @@ func TestParseDictIntValue(t *testing.T) {
 	}
 }
 
+// --- Unmarshal ---
+
+func TestUnmarshalSimpleStruct(t *testing.T) {
+	type Simple struct {
+		Name string `bencode:"name"`
+		Age  int    `bencode:"age"`
+	}
+	var s Simple
+	err := Unmarshal([]byte("d4:name5:alice3:agei30ee"), &s)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s.Name != "alice" {
+		t.Errorf("Name = %q, want %q", s.Name, "alice")
+	}
+	if s.Age != 30 {
+		t.Errorf("Age = %d, want %d", s.Age, 30)
+	}
+}
+
+func TestUnmarshalNestedStruct(t *testing.T) {
+	type Inner struct {
+		Value int `bencode:"value"`
+	}
+	type Outer struct {
+		Name  string `bencode:"name"`
+		Inner Inner  `bencode:"inner"`
+	}
+	var o Outer
+	err := Unmarshal([]byte("d4:name3:foo5:innerd5:valuei42eee"), &o)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if o.Name != "foo" {
+		t.Errorf("Name = %q, want %q", o.Name, "foo")
+	}
+	if o.Inner.Value != 42 {
+		t.Errorf("Inner.Value = %d, want %d", o.Inner.Value, 42)
+	}
+}
+
+func TestUnmarshalSliceOfStrings(t *testing.T) {
+	type WithList struct {
+		Items []string `bencode:"items"`
+	}
+	var w WithList
+	err := Unmarshal([]byte("d5:itemsl3:foo3:baree"), &w)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(w.Items) != 2 {
+		t.Fatalf("len(Items) = %d, want 2", len(w.Items))
+	}
+	if w.Items[0] != "foo" {
+		t.Errorf("Items[0] = %q, want %q", w.Items[0], "foo")
+	}
+	if w.Items[1] != "bar" {
+		t.Errorf("Items[1] = %q, want %q", w.Items[1], "bar")
+	}
+}
+
+func TestUnmarshalSliceOfStructs(t *testing.T) {
+	type Peer struct {
+		IP   string `bencode:"ip"`
+		Port int    `bencode:"port"`
+	}
+	type Response struct {
+		Peers []Peer `bencode:"peers"`
+	}
+	var r Response
+	err := Unmarshal([]byte("d5:peersld2:ip9:127.0.0.14:porti8080eeee"), &r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(r.Peers) != 1 {
+		t.Fatalf("len(Peers) = %d, want 1", len(r.Peers))
+	}
+	if r.Peers[0].IP != "127.0.0.1" {
+		t.Errorf("Peers[0].IP = %q, want %q", r.Peers[0].IP, "127.0.0.1")
+	}
+	if r.Peers[0].Port != 8080 {
+		t.Errorf("Peers[0].Port = %d, want %d", r.Peers[0].Port, 8080)
+	}
+}
+
+func TestUnmarshalMissingKeySkipped(t *testing.T) {
+	type Simple struct {
+		Name    string `bencode:"name"`
+		Missing string `bencode:"missing"`
+	}
+	var s Simple
+	err := Unmarshal([]byte("d4:name5:alicee"), &s)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s.Name != "alice" {
+		t.Errorf("Name = %q, want %q", s.Name, "alice")
+	}
+	if s.Missing != "" {
+		t.Errorf("Missing should be zero value, got %q", s.Missing)
+	}
+}
+
+func TestUnmarshalNotPointer(t *testing.T) {
+	type Simple struct {
+		Name string `bencode:"name"`
+	}
+	var s Simple
+	err := Unmarshal([]byte("d4:name5:alicee"), s)
+	if err == nil {
+		t.Fatal("expected error for non-pointer dest")
+	}
+}
+
+func TestUnmarshalByteSlice(t *testing.T) {
+	type WithBytes struct {
+		Data []byte `bencode:"data"`
+	}
+	var w WithBytes
+	err := Unmarshal([]byte("d4:data4:deadee"), &w)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(w.Data) != "dead" {
+		t.Errorf("Data = %q, want %q", w.Data, "dead")
+	}
+}
+
 // --- getParseFunc ---
 
 func TestGetParseFunc(t *testing.T) {
