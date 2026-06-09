@@ -96,34 +96,30 @@ func run() error {
 	type result struct {
 		Tracker string
 		Resp    *tracker_client.AnnounceResponse
+		Err     error
 	}
 	ch := make(chan result, len(trackers))
 	for _, url := range trackers {
 		url := url
 		go func() {
-			fmt.Printf("\n[%s]\n", url)
 			c, err := tracker_client.NewTrackerClient(url)
 			if err != nil {
-				fmt.Printf("  error: %v\n", err)
+				ch <- result{Tracker: url, Err: err}
 				return
 			}
 			resp, err := c.Announce(context.Background(), req)
-			if err != nil {
-				fmt.Printf("  error: %v\n", err)
-				return
-			}
-
-			ch <- result{
-				Tracker: url,
-				Resp:    resp,
-			}
+			ch <- result{Tracker: url, Resp: resp, Err: err}
 		}()
 	}
 
 	for range trackers {
 		res := <-ch
+		fmt.Printf("\n[%s]\n", res.Tracker)
+		if res.Err != nil {
+			fmt.Printf("  error: %v\n", res.Err)
+			continue
+		}
 		resp := res.Resp
-		fmt.Printf("\nAnswer from %s\n", res.Tracker)
 		fmt.Printf("  interval:   %d\n", resp.Interval)
 		fmt.Printf("  complete:   %d\n", resp.Complete)
 		fmt.Printf("  incomplete: %d\n", resp.Incomplete)
