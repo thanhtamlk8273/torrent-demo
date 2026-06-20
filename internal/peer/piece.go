@@ -1,5 +1,10 @@
 package peer
 
+import (
+	"fmt"
+	"torrent-demo/internal/mathutil"
+)
+
 const kBlockSize = 16 * 1024
 
 type Block []byte
@@ -13,7 +18,7 @@ type Piece struct {
 }
 
 func newPiece(w PieceWork) *Piece {
-	blockCount := (w.Size + kBlockSize - 1) / kBlockSize
+	blockCount := mathutil.CeilDiv(w.Size, kBlockSize)
 	return &Piece{
 		index:        w.Index,
 		expectedHash: w.Hash,
@@ -23,16 +28,19 @@ func newPiece(w PieceWork) *Piece {
 	}
 }
 
-func (p *Piece) saveBlock(begin uint32, block []byte) {
+func (p *Piece) saveBlock(begin uint32, block []byte) bool {
 	blockIndex := int(begin) / kBlockSize
 	if blockIndex < 0 || blockIndex >= len(p.blocks) {
-		return
+		fmt.Printf("Bad idx for %d, %d, %d\n", p.index, begin, len(block))
+		return false
 	}
 	if len(p.blocks[blockIndex]) > 0 {
-		return
+		fmt.Printf("Duplication for %d, %d, %d, %d\n", p.index, begin, len(block), len(p.blocks[blockIndex]))
+		return false
 	}
 	p.blocks[blockIndex] = block
 	p.remaining = p.remaining - 1
+	return true
 }
 
 func (p *Piece) complete() bool {

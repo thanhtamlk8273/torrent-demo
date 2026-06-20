@@ -16,6 +16,7 @@ type MetaInfo struct {
 
 type Info interface {
 	isInfo()
+	Common() InfoCommon
 }
 
 type InfoField struct{ Info }
@@ -33,7 +34,8 @@ type SingleFileInfo struct {
 	Length int    `bencode:"length"`
 }
 
-func (SingleFileInfo) isInfo() {}
+func (SingleFileInfo) isInfo()              {}
+func (i SingleFileInfo) Common() InfoCommon { return i.InfoCommon }
 
 type MultiFileInfo struct {
 	InfoCommon
@@ -41,7 +43,8 @@ type MultiFileInfo struct {
 	Files []FileEntry `bencode:"files"`
 }
 
-func (MultiFileInfo) isInfo() {}
+func (MultiFileInfo) isInfo()              {}
+func (i MultiFileInfo) Common() InfoCommon { return i.InfoCommon }
 
 type FileEntry struct {
 	Length int      `bencode:"length"`

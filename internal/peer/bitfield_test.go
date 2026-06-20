@@ -2,14 +2,14 @@ package peer
 
 import "testing"
 
-func TestSize(t *testing.T) {
+func TestBitfieldSize(t *testing.T) {
 	b := Bitfield([]byte{0x00, 0x00})
 	if b.Size() != 16 {
 		t.Errorf("expected 16, got %d", b.Size())
 	}
 }
 
-func TestExtend(t *testing.T) {
+func TestBitfieldExtend(t *testing.T) {
 	var b Bitfield
 
 	b.Extend(0)
@@ -35,7 +35,7 @@ func TestExtend(t *testing.T) {
 	}
 }
 
-func TestSetAndHas(t *testing.T) {
+func TestBitfieldSetAndHas(t *testing.T) {
 	var b Bitfield
 
 	for _, index := range []int{0, 1, 7, 8, 15, 16, 63} {
@@ -46,7 +46,7 @@ func TestSetAndHas(t *testing.T) {
 	}
 }
 
-func TestSetDoesNotAffectNeighbors(t *testing.T) {
+func TestBitfieldSetDoesNotAffectNeighbors(t *testing.T) {
 	var b Bitfield
 	b.Set(4)
 
@@ -60,7 +60,7 @@ func TestSetDoesNotAffectNeighbors(t *testing.T) {
 	}
 }
 
-func TestUnset(t *testing.T) {
+func TestBitfieldUnset(t *testing.T) {
 	var b Bitfield
 	b.Set(3)
 	b.Unset(3)
@@ -72,7 +72,7 @@ func TestUnset(t *testing.T) {
 	b.Unset(999)
 }
 
-func TestComplete(t *testing.T) {
+func TestBitfieldComplete(t *testing.T) {
 	var b Bitfield
 	total := 10
 
@@ -88,7 +88,7 @@ func TestComplete(t *testing.T) {
 	}
 }
 
-func TestHasOnEmptyBitfield(t *testing.T) {
+func TestBitfieldHasOnEmptyBitfield(t *testing.T) {
 	var b Bitfield
 	b.Extend(7)
 	for i := range 8 {

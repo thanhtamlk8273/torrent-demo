@@ -4,6 +4,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
+	"torrent-demo/internal/mathutil"
+	"torrent-demo/internal/metainfo"
 )
 
 type FileLayout struct {
@@ -14,10 +18,53 @@ type FileLayout struct {
 }
 
 type TorrentLayout struct {
+	location    string
 	torrentSize int64
 	pieceSize   int64
 	piecesCount int
 	files       []FileLayout
+}
+
+func NewTorrentLayout(location string, info metainfo.Info) (*TorrentLayout, error) {
+	if ok := dirExists(location); !ok {
+		return nil, fmt.Errorf("NewTorrentLayout: can't open %s\n", location)
+	}
+
+	var layout TorrentLayout
+	switch i := info.(type) {
+	case metainfo.SingleFileInfo:
+		layout.pieceSize = int64(i.InfoCommon.PieceLength)
+		layout.torrentSize = int64(i.Length)
+		fileLayout, err := openFileLayout(location, []string{i.Name}, 0, int64(i.Length))
+		if err != nil {
+			return nil, err
+		}
+		layout.files = append(layout.files, fileLayout)
+	case metainfo.MultiFileInfo:
+		layout.pieceSize = int64(i.InfoCommon.PieceLength)
+		torrentOffset := int64(0)
+		for _, fileInfo := range i.Files {
+			fileLayout, err := openFileLayout(location, fileInfo.Path, torrentOffset, int64(fileInfo.Length))
+			if err != nil {
+				return nil, err
+			}
+			layout.files = append(layout.files, fileLayout)
+			torrentOffset += int64(fileInfo.Length)
+			layout.torrentSize += int64(fileInfo.Length)
+		}
+	}
+
+	layout.location = location
+	layout.piecesCount = int(mathutil.CeilDiv(layout.torrentSize, layout.pieceSize))
+
+	return &layout, nil
+}
+
+func (l *TorrentLayout) pieceSizeAt(index int) int64 {
+	if index+1 == l.piecesCount {
+		return l.torrentSize - l.pieceSize*int64(index)
+	}
+	return l.pieceSize
 }
 
 func (l *TorrentLayout) writePiece(index int, data []byte) error {
@@ -79,7 +126,8 @@ func (l *TorrentLayout) readPiece(index int) ([]byte, error) {
 		return nil, fmt.Errorf("readPiece: no file covers piece %d", index)
 	}
 
-	readSize := l.pieceSize
+	readSize := l.pieceSizeAt(index)
+
 	for readSize > 0 && startIdx < len(l.files) {
 		fileLayout := l.files[startIdx]
 		fileOffset := pieceOffset - fileLayout.torrentOffset
@@ -111,7 +159,7 @@ func writeAtCapped(f *os.File, fileSize int64, offset int64, data []byte) ([]byt
 	return data[writeSize:], nil
 }
 
-func readAtCapped(f *os.File, fileSize int64, offset int64, dataSize int64) ([]byte, error) {
+func readAtCapped(f *os.File, _ int64, offset int64, dataSize int64) ([]byte, error) {
 	data := make([]byte, dataSize)
 	if n, err := f.ReadAt(data, offset); err != nil {
 		if err == io.EOF {
@@ -120,4 +168,59 @@ func readAtCapped(f *os.File, fileSize int64, offset int64, dataSize int64) ([]b
 		return nil, err
 	}
 	return data, nil
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
+
+func openFileLayout(location string, pathParts []string, torrentOffset int64, size int64) (FileLayout, error) {
+	filePath, err := safeJoin(location, pathParts...)
+	if err != nil {
+		return FileLayout{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+		return FileLayout{}, err
+	}
+	file, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0666)
+	if err != nil {
+		return FileLayout{}, err
+	}
+	if err := file.Truncate(size); err != nil {
+		return FileLayout{}, fmt.Errorf("openFileLayout: can't truncate %s: %w", filePath, err)
+	}
+	return FileLayout{
+		torrentOffset: torrentOffset,
+		path:          filePath,
+		size:          size,
+		file:          file,
+	}, nil
+}
+
+func safeJoin(base string, parts ...string) (string, error) {
+	for _, part := range parts {
+		if part == ".." || part == "" || filepath.IsAbs(part) {
+			return "", fmt.Errorf("safeJoin: invalid path segment %q", part)
+		}
+	}
+
+	joined := filepath.Join(append([]string{base}, parts...)...)
+
+	absBase, err := filepath.Abs(base)
+	if err != nil {
+		return "", err
+	}
+	absJoined, err := filepath.Abs(joined)
+	if err != nil {
+		return "", err
+	}
+	if absJoined != absBase && !strings.HasPrefix(absJoined, absBase+string(os.PathSeparator)) {
+		return "", fmt.Errorf("safeJoin: path %q escapes base directory %q", joined, base)
+	}
+
+	return joined, nil
 }

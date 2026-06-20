@@ -207,8 +207,8 @@ func TestRunBitfield(t *testing.T) {
 
 	select {
 	case <-errCh:
-		if len(p.bitField) == 0 || p.bitField[0] != 0xFF {
-			t.Errorf("bitField = %v, want [0xFF]", p.bitField)
+		if len(p.bitfield) == 0 || p.bitfield[0] != 0xFF {
+			t.Errorf("bitField = %v, want [0xFF]", p.bitfield)
 		}
 	case <-time.After(time.Second):
 		t.Error("timeout")
@@ -219,7 +219,7 @@ func TestRunHave(t *testing.T) {
 	var infoHash [20]byte
 	work, _ := singleBlockWork()
 	p, remote := newTestPeer(t, infoHash, newMock(work, true))
-	p.bitField = make(Bitfield, 1)
+	p.bitfield = make(Bitfield, 1)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -234,7 +234,7 @@ func TestRunHave(t *testing.T) {
 
 	select {
 	case <-errCh:
-		if !p.bitField.Has(3) {
+		if !p.bitfield.Has(3) {
 			t.Error("expected bit 3 set after Have(3)")
 		}
 	case <-time.After(time.Second):
@@ -324,10 +324,12 @@ func TestRunPieceWrongIndexIgnored(t *testing.T) {
 		select {
 		case <-sched.completedCh:
 			t.Error("CompletePiece should not be called for wrong index")
-		case <-sched.unclaimedCh:
-			t.Error("UnclaimPiece should not be called for wrong index")
+		case idx := <-sched.unclaimedCh:
+			if idx != 0 {
+				t.Errorf("UnclaimPiece index = %d, want 0", idx)
+			}
 		default:
-			// correct: scheduler untouched
+			t.Error("UnclaimPiece should be called for in-flight work when the peer exits")
 		}
 	case <-time.After(time.Second):
 		t.Error("timeout")

@@ -100,10 +100,16 @@ func testSimpleRoundTrip(t *testing.T, name string, msg interface {
 	}
 }
 
-func TestChoke_RoundTrip(t *testing.T)         { c := NewChoke(); testSimpleRoundTrip(t, "Choke", &c) }
-func TestUnChoke_RoundTrip(t *testing.T)        { u := NewUnChoke(); testSimpleRoundTrip(t, "UnChoke", &u) }
-func TestInterested_RoundTrip(t *testing.T)     { i := NewInterested(); testSimpleRoundTrip(t, "Interested", &i) }
-func TestNotInterested_RoundTrip(t *testing.T)  { ni := NewNotInterested(); testSimpleRoundTrip(t, "NotInterested", &ni) }
+func TestChoke_RoundTrip(t *testing.T)   { c := NewChoke(); testSimpleRoundTrip(t, "Choke", &c) }
+func TestUnChoke_RoundTrip(t *testing.T) { u := NewUnChoke(); testSimpleRoundTrip(t, "UnChoke", &u) }
+func TestInterested_RoundTrip(t *testing.T) {
+	i := NewInterested()
+	testSimpleRoundTrip(t, "Interested", &i)
+}
+func TestNotInterested_RoundTrip(t *testing.T) {
+	ni := NewNotInterested()
+	testSimpleRoundTrip(t, "NotInterested", &ni)
+}
 
 func TestChoke_ReadFrom_BadLength(t *testing.T) {
 	buf := bytes.NewBuffer([]byte{0, 0, 0, 2, 0}) // length=2, not 1
