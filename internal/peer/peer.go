@@ -11,7 +11,8 @@ import (
 )
 
 const (
-	kMessageChannelSize int = 16
+	kMessageChannelSize int = 64
+	kMaxParallelChunks      = 8
 	kDialTimeout            = 5 * time.Second
 	kHandshakeTimeout       = 10 * time.Second
 )
@@ -40,16 +41,8 @@ type Reporter interface {
 	PeerDisconnected(addr string, err error)
 }
 
-type State int
-
-const (
-	Free State = iota
-	Downloading
-)
-
 type PeerConnection struct {
-	conn   *net.TCPConn
-	sendCh chan message.Message
+	conn *net.TCPConn
 
 	lastAliveTime time.Time
 	amChoking     bool
@@ -62,13 +55,12 @@ type PeerConnection struct {
 
 	bitfield Bitfield
 
-	currentPiece *Piece
-	nextIdx      uint32
-	state        State
+	currentPiece     *Piece
+	nextIdx          uint32
+	nbParallelChunks int
 
 	scheduler PieceScheduler
-
-	reporter Reporter // debug-only: nil-safe, no-op unless SetReporter is called
+	reporter  Reporter // debug-only: nil-safe, no-op unless SetReporter is called
 }
 
 // SetReporter attaches a debug-only observer for this connection's lifecycle
@@ -84,20 +76,19 @@ func NewPeerConnection(ip string, port int, infoHash, peerId [20]byte, scheduler
 		return PeerConnection{}, err
 	}
 	return PeerConnection{
-		conn:          conn.(*net.TCPConn),
-		sendCh:        make(chan message.Message, kMessageChannelSize),
-		lastAliveTime: time.Now(),
-		amChoking:     true,
-		amInterested:  false,
-		isChoking:     true,
-		isInterested:  false,
-		infoHash:      infoHash,
-		peerId:        peerId,
-		bitfield:      Bitfield{},
-		currentPiece:  nil,
-		nextIdx:       0,
-		state:         Free,
-		scheduler:     scheduler,
+		conn:             conn.(*net.TCPConn),
+		lastAliveTime:    time.Now(),
+		amChoking:        true,
+		amInterested:     false,
+		isChoking:        true,
+		isInterested:     false,
+		infoHash:         infoHash,
+		peerId:           peerId,
+		bitfield:         Bitfield{},
+		currentPiece:     nil,
+		nextIdx:          0,
+		nbParallelChunks: 0,
+		scheduler:        scheduler,
 	}, nil
 }
 
@@ -148,74 +139,76 @@ func (p *PeerConnection) Run(ctx context.Context) (retErr error) {
 		defer func() { p.reporter.PeerDisconnected(addr, retErr) }()
 	}
 
-	fmt.Printf("[%s] handshake complete\n", p.conn.RemoteAddr())
-
-	go p.sendLoop(ctx, cancel)
 	go p.keepAliveLoop(ctx)
-	go func() {
-		// p.read() below blocks on the socket and doesn't observe ctx
-		// cancellation directly; closing the conn unblocks it immediately.
-		<-ctx.Done()
-		p.conn.Close()
-	}()
 
 	p.amChoking = true
 	p.amInterested = true
 	p.sendInterested()
 
+	advanceTicker := time.NewTicker(250 * time.Millisecond)
+	recvMsg := p.createReadChannel(ctx, cancel)
 	for {
-		// Redundant but put here for early exit
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
+		case msg := <-recvMsg:
+			p.processMessage(msg)
+			p.advance()
+		case <-advanceTicker.C:
+			p.advance()
 		}
+	}
+}
 
-		if p.currentPiece == nil {
-			if w, ok := p.scheduler.GetWork(p.bitfield); !ok {
-				// time.Sleep(5 * time.Second)
+func (p *PeerConnection) createReadChannel(ctx context.Context, cancel context.CancelFunc) <-chan message.Message {
+	conn := p.conn
+	recvMsgChan := make(chan message.Message)
+	go func() {
+		// p.read() below blocks on the socket and doesn't observe ctx
+		// cancellation directly; closing the conn unblocks it immediately.
+		<-ctx.Done()
+		conn.Close()
+	}()
+
+	go func() {
+		for {
+			msg, err := message.Read(conn)
+			if err != nil {
+				cancel()
+				return
 			} else {
-				fmt.Printf("[%s] downloading piece %d (%d bytes)\n", p.conn.RemoteAddr(), w.Index, w.Size)
-				p.currentPiece = newPiece(w)
-				if p.reporter != nil { // debug-only
-					p.reporter.PieceStarted(p.conn.RemoteAddr().String(), w.Index, len(p.currentPiece.blocks))
+				select {
+				case recvMsgChan <- msg:
+				case <-ctx.Done():
+					return
 				}
 			}
 		}
+	}()
 
-		if p.state == Free && !p.isChoking {
-			p.requestNextChunk()
-		}
+	return recvMsgChan
+}
 
-		msg, err := p.read()
-		if err != nil {
-			return err
-		}
-
-		p.lastAliveTime = time.Now()
-
-		switch m := msg.(type) {
-		case *message.KeepAlive:
-			// liveness tracked above, nothing else to do
-		case *message.Interested:
-			p.isInterested = true
-			//p.sendUnchoke()
-		case *message.NotInterested:
-			p.isInterested = false
-			p.sendChoke()
-		case *message.Choke:
-			p.isChoking = true
-		case *message.UnChoke:
-			p.isChoking = false
-		case *message.Bitfield:
-			p.bitfield = m.Field
-			fmt.Printf("[%s] bitfield received (%d bytes)\n", p.conn.RemoteAddr(), len(m.Field))
-		case *message.Have:
-			p.bitfield.Set(int(m.PieceIndex))
-		case *message.Piece:
-			if p.currentPiece == nil {
-				continue
-			}
+func (p *PeerConnection) processMessage(msg message.Message) {
+	p.lastAliveTime = time.Now()
+	switch m := msg.(type) {
+	case *message.KeepAlive:
+		// liveness tracked above, nothing else to do
+	case *message.Interested:
+		p.isInterested = true
+		//p.sendUnchoke()
+	case *message.NotInterested:
+		p.isInterested = false
+	case *message.Choke:
+		p.isChoking = true
+	case *message.UnChoke:
+		p.isChoking = false
+	case *message.Bitfield:
+		p.bitfield = m.Field
+	case *message.Have:
+		p.bitfield.Set(int(m.PieceIndex))
+	case *message.Piece:
+		if p.currentPiece != nil {
 			if m.Index != uint32(p.currentPiece.index) {
 				// stale block for a piece we've moved on from; dropped silently
 			} else if p.currentPiece.saveBlock(m.Begin, m.Block) {
@@ -227,13 +220,11 @@ func (p *PeerConnection) Run(ctx context.Context) (retErr error) {
 				data := p.currentPiece.assemble()
 				hash := sha1.Sum(data)
 				if hash != p.currentPiece.expectedHash {
-					fmt.Printf("[%s] piece %d verification FAILED (hash mismatch), dropping\n", p.conn.RemoteAddr(), p.currentPiece.index)
 					if p.reporter != nil { // debug-only
 						p.reporter.PieceFailed(p.conn.RemoteAddr().String(), fmt.Sprintf("piece %d hash mismatch", p.currentPiece.index))
 					}
 					p.scheduler.UnclaimPiece(p.currentPiece.index)
 				} else {
-					fmt.Printf("[%s] piece %d verified OK, completed\n", p.conn.RemoteAddr(), p.currentPiece.index)
 					p.scheduler.CompletePiece(p.currentPiece.index, data)
 					if p.reporter != nil { // debug-only
 						p.reporter.PieceCompleted(p.conn.RemoteAddr().String(), p.currentPiece.index)
@@ -242,34 +233,32 @@ func (p *PeerConnection) Run(ctx context.Context) (retErr error) {
 				p.currentPiece = nil
 				p.nextIdx = 0
 			}
-			p.state = Free
-		}
-	}
-}
-
-func (p *PeerConnection) sendLoop(ctx context.Context, cancel context.CancelFunc) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case msg := <-p.sendCh:
-			if _, err := msg.WriteTo(p.conn); err != nil {
-				cancel()
-				return
+			if p.nbParallelChunks > 0 {
+				p.nbParallelChunks -= 1
 			}
 		}
 	}
 }
 
-func (p *PeerConnection) send(msg message.Message) {
-	select {
-	case p.sendCh <- msg:
-	default:
+func (p *PeerConnection) advance() {
+	if p.currentPiece == nil {
+		if w, ok := p.scheduler.GetWork(p.bitfield); ok {
+			if p.currentPiece != nil {
+				panic("p.currentPiece should be NULL when new work comes")
+			}
+			p.currentPiece = newPiece(w)
+			if p.reporter != nil { // debug-only
+				p.reporter.PieceStarted(p.conn.RemoteAddr().String(), w.Index, len(p.currentPiece.blocks))
+			}
+		}
 	}
-}
-
-func (p *PeerConnection) read() (message.Message, error) {
-	return message.Read(p.conn)
+	if !p.isChoking {
+		for p.nbParallelChunks < kMaxParallelChunks {
+			if ok := p.requestNextChunk(); !ok {
+				break
+			}
+		}
+	}
 }
 
 func (p *PeerConnection) keepAliveLoop(ctx context.Context) {
@@ -287,7 +276,7 @@ func (p *PeerConnection) keepAliveLoop(ctx context.Context) {
 }
 
 func (p *PeerConnection) requestNextChunk() bool {
-	if p.currentPiece == nil || p.state == Downloading {
+	if p.currentPiece == nil || p.nbParallelChunks >= kMaxParallelChunks {
 		return false
 	}
 	if p.nextIdx*kBlockSize >= uint32(p.currentPiece.pieceSize) {
@@ -297,8 +286,8 @@ func (p *PeerConnection) requestNextChunk() bool {
 	if (p.nextIdx+1)*kBlockSize > uint32(p.currentPiece.pieceSize) {
 		chunkSize = uint32(p.currentPiece.pieceSize) - p.nextIdx*kBlockSize
 	}
-	p.sendRequest(uint32(p.currentPiece.index), p.nextIdx*chunkSize, chunkSize)
-	p.state = Downloading
+	p.sendRequest(uint32(p.currentPiece.index), p.nextIdx*kBlockSize, chunkSize)
+	p.nbParallelChunks += 1
 	p.nextIdx += 1
 	return true
 }

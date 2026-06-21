@@ -64,7 +64,6 @@ func newTestPeer(t *testing.T, infoHash [20]byte, sched *mockScheduler) (*PeerCo
 
 	p := &PeerConnection{
 		conn:      clientConn.(*net.TCPConn),
-		sendCh:    make(chan message.Message, 16),
 		infoHash:  infoHash,
 		scheduler: sched,
 	}
@@ -91,6 +90,32 @@ func singleBlockWork() (PieceWork, []byte) {
 	data := make([]byte, kBlockSize)
 	hash := sha1.Sum(data)
 	return PieceWork{Index: 0, Size: kBlockSize, Hash: hash}, data
+}
+
+// unchokeAndAwaitRequest drives the peer through the real state machine before
+// a Piece can be delivered: a freshly handshaken peer is choked and will not
+// claim work or send Request messages until it is unchoked. We send UnChoke,
+// then read remote-bound messages until the peer's block Request arrives. Only
+// then has the peer set up its in-flight piece and is ready to accept the
+// matching Piece. Returns the observed Request so callers can assert on it.
+func unchokeAndAwaitRequest(t *testing.T, remote net.Conn) message.Request {
+	t.Helper()
+	unchoke := message.NewUnChoke()
+	if _, err := unchoke.WriteTo(remote); err != nil {
+		t.Error("remote: failed to write unchoke:", err)
+		return message.Request{}
+	}
+	for {
+		msg, err := message.Read(remote)
+		if err != nil {
+			t.Error("remote: failed to read message while awaiting request:", err)
+			return message.Request{}
+		}
+		if req, ok := msg.(*message.Request); ok {
+			return *req
+		}
+		// Skip the peer's Interested (and any other pre-request) messages.
+	}
 }
 
 func TestHandshakeInfoHashMismatch(t *testing.T) {
@@ -254,6 +279,10 @@ func TestRunPieceCompleteHashMatch(t *testing.T) {
 
 	go func() {
 		doHandshake(t, remote, infoHash)
+		req := unchokeAndAwaitRequest(t, remote)
+		if req.Index != 0 {
+			t.Errorf("requested index = %d, want 0", req.Index)
+		}
 		piece := message.NewPiece(0, 0, blockData)
 		piece.WriteTo(remote)
 	}()
@@ -265,7 +294,7 @@ func TestRunPieceCompleteHashMatch(t *testing.T) {
 		}
 	case <-sched.unclaimedCh:
 		t.Error("UnclaimPiece should not be called on hash match")
-	case <-time.After(time.Second):
+	case <-time.After(1 * time.Second):
 		t.Error("timeout waiting for CompletePiece")
 	}
 }
@@ -282,6 +311,7 @@ func TestRunPieceCompleteHashMismatch(t *testing.T) {
 
 	go func() {
 		doHandshake(t, remote, infoHash)
+		unchokeAndAwaitRequest(t, remote)
 		badData := make([]byte, kBlockSize)
 		badData[0] = 0xFF // won't match the all-zero hash in work
 		piece := message.NewPiece(0, 0, badData)
