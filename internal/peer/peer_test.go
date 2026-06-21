@@ -72,9 +72,20 @@ func newTestPeer(t *testing.T, infoHash [20]byte, sched *mockScheduler) (*PeerCo
 	t.Cleanup(func() { remote.Close(); clientConn.Close() })
 
 	p := &PeerConnection{
-		conn:      clientConn.(*net.TCPConn),
-		infoHash:  infoHash,
-		scheduler: sched,
+		conn:     clientConn.(*net.TCPConn),
+		infoHash: infoHash,
+		leecher: Leecher{
+			conn:         clientConn.(*net.TCPConn),
+			isChoking:    true,
+			bitfieldSize: sched.GetLocalBitfield().n,
+			scheduler:    sched,
+		},
+		seeder: Seeder{
+			conn:          clientConn.(*net.TCPConn),
+			amChoking:     true,
+			localBitfield: sched.GetLocalBitfield(),
+			scheduler:     sched,
+		},
 	}
 	return p, remote
 }
@@ -188,7 +199,7 @@ func TestRunChoke(t *testing.T) {
 
 	select {
 	case <-errCh:
-		if !p.isChoking {
+		if !p.leecher.isChoking {
 			t.Error("expected isChoking = true after Choke")
 		}
 	case <-time.After(time.Second):
@@ -200,7 +211,7 @@ func TestRunUnChoke(t *testing.T) {
 	var infoHash [20]byte
 	work, _ := singleBlockWork()
 	p, remote := newTestPeer(t, infoHash, newMock(work, true))
-	p.isChoking = true
+	p.leecher.isChoking = true
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -215,7 +226,7 @@ func TestRunUnChoke(t *testing.T) {
 
 	select {
 	case <-errCh:
-		if p.isChoking {
+		if p.leecher.isChoking {
 			t.Error("expected isChoking = false after UnChoke")
 		}
 	case <-time.After(time.Second):
@@ -241,7 +252,7 @@ func TestRunBitfield(t *testing.T) {
 
 	select {
 	case <-errCh:
-		if b := p.bitfield.Bytes(); len(b) == 0 || b[0] != 0xFF {
+		if b := p.leecher.bitfield.Bytes(); len(b) == 0 || b[0] != 0xFF {
 			t.Errorf("bitField = %v, want [0xFF]", b)
 		}
 	case <-time.After(time.Second):
@@ -253,7 +264,7 @@ func TestRunHave(t *testing.T) {
 	var infoHash [20]byte
 	work, _ := singleBlockWork()
 	p, remote := newTestPeer(t, infoHash, newMock(work, true))
-	p.bitfield = *NewBitfield(make([]byte, 1), 8)
+	p.leecher.bitfield = *NewBitfield(make([]byte, 1), 8)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -268,7 +279,7 @@ func TestRunHave(t *testing.T) {
 
 	select {
 	case <-errCh:
-		if !p.bitfield.Has(3) {
+		if !p.leecher.bitfield.Has(3) {
 			t.Error("expected bit 3 set after Have(3)")
 		}
 	case <-time.After(time.Second):

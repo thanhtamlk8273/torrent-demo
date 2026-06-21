@@ -225,7 +225,15 @@ func (ui *UI) render() (active, upload, progress string) {
 	for addr := range ui.active {
 		addrs = append(addrs, addr)
 	}
-	sort.Strings(addrs)
+	sort.Slice(addrs, func(i, j int) bool {
+		pi, pj := ui.active[addrs[i]], ui.active[addrs[j]]
+		ai := pi.hasPiece || pi.rateBps > 0 || pi.upRateBps > 0
+		aj := pj.hasPiece || pj.rateBps > 0 || pj.upRateBps > 0
+		if ai != aj {
+			return ai
+		}
+		return addrs[i] < addrs[j]
+	})
 
 	var b strings.Builder
 	if len(addrs) == 0 {
