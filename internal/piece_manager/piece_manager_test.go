@@ -32,11 +32,11 @@ func newTestPM(t *testing.T) *PieceManager {
 
 // fullBitfield returns a bitfield advertising all 3 pieces as available.
 func fullBitfield() peer.Bitfield {
-	bf := make(peer.Bitfield, 1)
+	bf := peer.NewBitfield(make([]byte, 1), 3)
 	bf.Set(0)
 	bf.Set(1)
 	bf.Set(2)
-	return bf
+	return *bf
 }
 
 func TestGetWorkClaimsEachAvailablePieceOnce(t *testing.T) {
@@ -66,7 +66,7 @@ func TestGetWorkClaimsEachAvailablePieceOnce(t *testing.T) {
 
 func TestGetWorkSkipsPiecesThePeerLacks(t *testing.T) {
 	pm := newTestPM(t)
-	bf := make(peer.Bitfield, 1) // peer advertises nothing
+	bf := *peer.NewBitfield(make([]byte, 1), 3) // peer advertises nothing
 
 	if _, ok := pm.GetWork(bf); ok {
 		t.Error("expected no work when the peer has no pieces")
@@ -75,7 +75,7 @@ func TestGetWorkSkipsPiecesThePeerLacks(t *testing.T) {
 
 func TestGetWorkReturnsLowestIndexAvailable(t *testing.T) {
 	pm := newTestPM(t)
-	bf := make(peer.Bitfield, 1)
+	bf := *peer.NewBitfield(make([]byte, 1), 3)
 	bf.Set(2) // only piece 2 is available
 
 	w, ok := pm.GetWork(bf)

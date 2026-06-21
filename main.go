@@ -86,6 +86,14 @@ func (s *limitedScheduler) UnclaimPiece(index int) {
 	s.release(index)
 }
 
+func (s *limitedScheduler) GetLocalBitfield() peer.Bitfield {
+	return s.base.GetLocalBitfield()
+}
+
+func (s *limitedScheduler) GetBlock(index, begin, length int) ([]byte, error) {
+	return s.base.GetBlock(index, begin, length)
+}
+
 func (s *limitedScheduler) release(index int) {
 	s.mu.Lock()
 	_, ok := s.active[index]

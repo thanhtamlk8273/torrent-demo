@@ -27,6 +27,10 @@ type PieceScheduler interface {
 	GetWork(bf Bitfield) (PieceWork, bool)
 	CompletePiece(index int, data []byte) error
 	UnclaimPiece(index int)
+
+	// Maybe should be a seperate interface
+	GetLocalBitfield() Bitfield
+	GetBlock(index, begin, length int) ([]byte, error)
 }
 
 // Reporter receives debug-only lifecycle signals for one peer connection so
@@ -39,6 +43,7 @@ type Reporter interface {
 	PieceCompleted(addr string, index int)
 	PieceFailed(addr, reason string)
 	PeerDisconnected(addr string, err error)
+	BlockSent(addr string, size int)
 }
 
 type PeerConnection struct {
@@ -53,7 +58,8 @@ type PeerConnection struct {
 	infoHash [20]byte
 	peerId   [20]byte
 
-	bitfield Bitfield
+	localBitfield Bitfield
+	bitfield      Bitfield
 
 	currentPiece     *Piece
 	nextIdx          uint32
@@ -93,12 +99,17 @@ func NewPeerConnection(ip string, port int, infoHash, peerId [20]byte, scheduler
 }
 
 func (p *PeerConnection) connect() error {
-	if err := p.sendHandshake(); err != nil {
+	if err := sendHandshake(p.conn, p.infoHash, p.peerId); err != nil {
 		return err
 	}
-
-	if err := p.receiveHandshake(); err != nil {
+	if err := receiveHandshake(p.conn, p.infoHash); err != nil {
 		return err
+	}
+	if p.localBitfield = p.scheduler.GetLocalBitfield(); p.localBitfield.Any() {
+		sendBitfield(p.conn, p.localBitfield)
+	}
+	if err := sendUnchoke(p.conn); err == nil {
+		p.amChoking = false
 	}
 	return nil
 }
@@ -143,7 +154,7 @@ func (p *PeerConnection) Run(ctx context.Context) (retErr error) {
 
 	p.amChoking = true
 	p.amInterested = true
-	p.sendInterested()
+	sendInterested(p.conn)
 
 	advanceTicker := time.NewTicker(250 * time.Millisecond)
 	recvMsg := p.createReadChannel(ctx, cancel)
@@ -195,18 +206,35 @@ func (p *PeerConnection) processMessage(msg message.Message) {
 	case *message.KeepAlive:
 		// liveness tracked above, nothing else to do
 	case *message.Interested:
+		fmt.Printf("Received *message.Interested")
 		p.isInterested = true
-		//p.sendUnchoke()
+		if err := sendUnchoke(p.conn); err == nil {
+			p.amChoking = false
+		}
 	case *message.NotInterested:
+		fmt.Printf("Received *message.NotInterested")
 		p.isInterested = false
+		p.amChoking = true
 	case *message.Choke:
 		p.isChoking = true
-	case *message.UnChoke:
+	case *message.Unchoke:
 		p.isChoking = false
 	case *message.Bitfield:
-		p.bitfield = m.Field
+		// The wire bytes can't tell us the piece count; it comes from the
+		// torrent metadata, carried locally by localBitfield.
+		p.bitfield = *NewBitfield(m.Field, p.localBitfield.Size())
 	case *message.Have:
 		p.bitfield.Set(int(m.PieceIndex))
+	case *message.Request:
+		fmt.Printf("Received *message.Request %d, %d, %d", m.Begin, m.Index, m.Length)
+		if !p.amChoking {
+			requestedBlock, err := p.scheduler.GetBlock(int(m.Index), int(m.Begin), int(m.Length))
+			if err == nil && len(requestedBlock) == int(m.Length) {
+				if sendErr := sendPiece(p.conn, m.Index, m.Begin, requestedBlock); sendErr == nil && p.reporter != nil {
+					p.reporter.BlockSent(p.conn.RemoteAddr().String(), len(requestedBlock)) // debug-only
+				}
+			}
+		}
 	case *message.Piece:
 		if p.currentPiece != nil {
 			if m.Index != uint32(p.currentPiece.index) {
@@ -251,6 +279,14 @@ func (p *PeerConnection) advance() {
 				p.reporter.PieceStarted(p.conn.RemoteAddr().String(), w.Index, len(p.currentPiece.blocks))
 			}
 		}
+
+		localBitfield := p.scheduler.GetLocalBitfield()
+		for idx := range localBitfield.Size() {
+			if localBitfield.Has(idx) && !p.localBitfield.Has(idx) {
+				sendHave(p.conn, uint32(idx))
+			}
+		}
+		p.localBitfield = localBitfield
 	}
 	if !p.isChoking {
 		for p.nbParallelChunks < kMaxParallelChunks {
@@ -270,7 +306,7 @@ func (p *PeerConnection) keepAliveLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			p.sendKeepAlive()
+			sendKeepAlive(p.conn)
 		}
 	}
 }
@@ -286,55 +322,9 @@ func (p *PeerConnection) requestNextChunk() bool {
 	if (p.nextIdx+1)*kBlockSize > uint32(p.currentPiece.pieceSize) {
 		chunkSize = uint32(p.currentPiece.pieceSize) - p.nextIdx*kBlockSize
 	}
-	p.sendRequest(uint32(p.currentPiece.index), p.nextIdx*kBlockSize, chunkSize)
+	sendRequest(p.conn, uint32(p.currentPiece.index), p.nextIdx*kBlockSize, chunkSize)
 	p.nbParallelChunks += 1
 	p.nextIdx += 1
 	return true
 }
 
-func (p *PeerConnection) sendHandshake() error {
-	handShake := message.NewHandshake(p.infoHash, p.peerId)
-	_, err := handShake.WriteTo(p.conn)
-	return err
-}
-
-func (p *PeerConnection) receiveHandshake() error {
-	var handShake message.Handshake
-	if _, err := handShake.ReadFrom(p.conn); err != nil {
-		return err
-	}
-	if handShake.InfoHash != p.infoHash {
-		return fmt.Errorf("info_hash mismatch")
-	}
-	return nil
-}
-
-func (p *PeerConnection) sendKeepAlive() error {
-	keepAlive := message.NewKeepAlive()
-	_, err := keepAlive.WriteTo(p.conn)
-	return err
-}
-
-func (p *PeerConnection) sendInterested() error {
-	interested := message.NewInterested()
-	_, err := interested.WriteTo(p.conn)
-	return err
-}
-
-func (p *PeerConnection) sendNotInterested() error {
-	notInterested := message.NewNotInterested()
-	_, err := notInterested.WriteTo(p.conn)
-	return err
-}
-
-func (p *PeerConnection) sendChoke() error {
-	choke := message.NewChoke()
-	_, err := choke.WriteTo(p.conn)
-	return err
-}
-
-func (p *PeerConnection) sendRequest(index, begin, length uint32) error {
-	req := message.NewRequest(index, begin, length)
-	_, err := req.WriteTo(p.conn)
-	return err
-}

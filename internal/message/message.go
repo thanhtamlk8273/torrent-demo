@@ -44,7 +44,7 @@ type KeepAlive struct{}
 
 type Choke struct{}
 
-type UnChoke struct{}
+type Unchoke struct{}
 
 type Interested struct{}
 
@@ -104,7 +104,7 @@ func Read(r io.Reader) (Message, error) {
 		if length != lenUnchoke {
 			return nil, fmt.Errorf("expected unchoke length %d, got %d", lenUnchoke, length)
 		}
-		m := &UnChoke{}
+		m := &Unchoke{}
 		_, err := m.readBody(r, length)
 		return m, err
 	case idInterested:
@@ -253,7 +253,7 @@ func (ka *KeepAlive) ReadFrom(r io.Reader) (int64, error) {
 }
 
 func NewChoke() Choke                 { return Choke{} }
-func NewUnChoke() UnChoke             { return UnChoke{} }
+func NewUnchoke() Unchoke             { return Unchoke{} }
 func NewInterested() Interested       { return Interested{} }
 func NewNotInterested() NotInterested { return NotInterested{} }
 
@@ -284,7 +284,7 @@ func (c *Choke) readBody(_ io.Reader, _ uint32) (int64, error) {
 	return 0, nil
 }
 
-func (u *UnChoke) WriteTo(w io.Writer) (int64, error) {
+func (u *Unchoke) WriteTo(w io.Writer) (int64, error) {
 	buf := make([]byte, 0, 5)
 	buf = binary.BigEndian.AppendUint32(buf, lenUnchoke)
 	buf = append(buf, idUnchoke)
@@ -292,7 +292,7 @@ func (u *UnChoke) WriteTo(w io.Writer) (int64, error) {
 	return int64(n), err
 }
 
-func (u *UnChoke) ReadFrom(r io.Reader) (int64, error) {
+func (u *Unchoke) ReadFrom(r io.Reader) (int64, error) {
 	length, id, n, err := readHeader(r)
 	if err != nil {
 		return n, err
@@ -307,7 +307,7 @@ func (u *UnChoke) ReadFrom(r io.Reader) (int64, error) {
 	return n + bn, err
 }
 
-func (u *UnChoke) readBody(_ io.Reader, _ uint32) (int64, error) {
+func (u *Unchoke) readBody(_ io.Reader, _ uint32) (int64, error) {
 	return 0, nil
 }
 

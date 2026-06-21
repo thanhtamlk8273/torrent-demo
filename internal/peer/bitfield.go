@@ -1,9 +1,21 @@
 package peer
 
-type Bitfield []byte
+type Bitfield struct {
+	bits []byte
+	n    int
+}
+
+func NewBitfield(bits []byte, n int) *Bitfield {
+	return &Bitfield{bits, n}
+}
+
+// Bytes returns the underlying bytes for serialization onto the wire.
+func (b *Bitfield) Bytes() []byte {
+	return b.bits
+}
 
 func (b *Bitfield) Size() int {
-	return len(*b) * 8
+	return b.n
 }
 
 func (b *Bitfield) Extend(index int) {
@@ -11,31 +23,53 @@ func (b *Bitfield) Extend(index int) {
 		return
 	}
 	newSize := index/8 + 1
-	*b = append(*b, make([]byte, newSize-len(*b))...)
+	b.bits = append(b.bits, make([]byte, newSize-len(b.bits))...)
+	b.n = index + 1
 }
 
 func (b *Bitfield) Has(index int) bool {
 	if index >= b.Size() {
 		return false
 	}
-	return (*b)[index/8]>>(7-index%8)&1 == 1
+	return b.bits[index/8]>>(7-index%8)&1 == 1
 }
 
 func (b *Bitfield) Set(index int) {
 	b.Extend(index)
-	(*b)[index/8] |= 1 << (7 - index%8)
+	b.bits[index/8] |= 1 << (7 - index%8)
 }
 
 func (b *Bitfield) Unset(index int) {
 	if index >= b.Size() {
 		return
 	}
-	(*b)[index/8] &^= 1 << (7 - index%8)
+	b.bits[index/8] &^= 1 << (7 - index%8)
 }
 
-func (b *Bitfield) Complete(total int) bool {
-	for i := range total {
+func (b *Bitfield) Complete() bool {
+	for i := range b.Size() {
 		if !b.Has(i) {
+			return false
+		}
+	}
+	return true
+}
+
+func (b *Bitfield) Any() bool {
+	for i := range b.Size() {
+		if b.Has(i) {
+			return true
+		}
+	}
+	return false
+}
+
+func (b *Bitfield) Equal(other Bitfield) bool {
+	if b.Size() != other.Size() {
+		return false
+	}
+	for idx := range b.Size() {
+		if b.Has(idx) != other.Has(idx) {
 			return false
 		}
 	}

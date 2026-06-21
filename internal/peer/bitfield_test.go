@@ -1,11 +1,33 @@
 package peer
 
-import "testing"
+import (
+	"bytes"
+	"testing"
+)
 
 func TestBitfieldSize(t *testing.T) {
-	b := Bitfield([]byte{0x00, 0x00})
+	b := NewBitfield([]byte{0x00, 0x00}, 16)
 	if b.Size() != 16 {
 		t.Errorf("expected 16, got %d", b.Size())
+	}
+}
+
+func TestBitfieldNewAndBytes(t *testing.T) {
+	raw := []byte{0b10100000}
+	b := NewBitfield(raw, 3)
+
+	if b.Size() != 3 {
+		t.Errorf("expected size 3, got %d", b.Size())
+	}
+	if !b.Has(0) || b.Has(1) || !b.Has(2) {
+		t.Errorf("unexpected bits: Has(0)=%v Has(1)=%v Has(2)=%v", b.Has(0), b.Has(1), b.Has(2))
+	}
+	// Index past n is out of the valid range even though the byte has spare bits.
+	if b.Has(3) {
+		t.Error("expected index 3 to be out of range")
+	}
+	if !bytes.Equal(b.Bytes(), raw) {
+		t.Errorf("Bytes() = %v, want %v", b.Bytes(), raw)
 	}
 }
 
@@ -13,25 +35,25 @@ func TestBitfieldExtend(t *testing.T) {
 	var b Bitfield
 
 	b.Extend(0)
-	if len(b) != 1 {
-		t.Errorf("expected 1 byte, got %d", len(b))
+	if len(b.bits) != 1 {
+		t.Errorf("expected 1 byte, got %d", len(b.bits))
 	}
 
 	b.Extend(7)
-	if len(b) != 1 {
-		t.Errorf("expected 1 byte after extending to index 7, got %d", len(b))
+	if len(b.bits) != 1 {
+		t.Errorf("expected 1 byte after extending to index 7, got %d", len(b.bits))
 	}
 
 	b.Extend(8)
-	if len(b) != 2 {
-		t.Errorf("expected 2 bytes after extending to index 8, got %d", len(b))
+	if len(b.bits) != 2 {
+		t.Errorf("expected 2 bytes after extending to index 8, got %d", len(b.bits))
 	}
 
 	// Extend to already covered index should be no-op
-	prev := len(b)
+	prev := len(b.bits)
 	b.Extend(8)
-	if len(b) != prev {
-		t.Errorf("expected no-op extend, got %d", len(b))
+	if len(b.bits) != prev {
+		t.Errorf("expected no-op extend, got %d", len(b.bits))
 	}
 }
 
@@ -74,16 +96,17 @@ func TestBitfieldUnset(t *testing.T) {
 
 func TestBitfieldComplete(t *testing.T) {
 	var b Bitfield
-	total := 10
 
-	for i := range total {
-		if b.Complete(total) {
-			t.Errorf("should not be complete after setting %d pieces", i)
-		}
-		b.Set(i)
+	// Grow the domain to 10 with a single high bit, leaving gaps below it.
+	b.Set(9)
+	if b.Complete() {
+		t.Error("should not be complete with bits 0-8 unset")
 	}
 
-	if !b.Complete(total) {
+	for i := range 10 {
+		b.Set(i)
+	}
+	if !b.Complete() {
 		t.Error("expected bitfield to be complete")
 	}
 }

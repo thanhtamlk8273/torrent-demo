@@ -3,6 +3,7 @@ package peer
 import (
 	"context"
 	"crypto/sha1"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 type mockScheduler struct {
 	work        PieceWork
 	hasWork     bool
+	local       Bitfield
 	completedCh chan int
 	unclaimedCh chan int
 }
@@ -22,6 +24,9 @@ func newMock(work PieceWork, hasWork bool) *mockScheduler {
 	return &mockScheduler{
 		work:        work,
 		hasWork:     hasWork,
+		// 8-piece domain with nothing owned: Any() is false (so connect()
+		// won't send a bitfield) but Size() gives remote bitfields a count.
+		local:       *NewBitfield(make([]byte, 1), 8),
 		completedCh: make(chan int, 1),
 		unclaimedCh: make(chan int, 1),
 	}
@@ -33,6 +38,10 @@ func (m *mockScheduler) CompletePiece(index int, _ []byte) error {
 	return nil
 }
 func (m *mockScheduler) UnclaimPiece(index int) { m.unclaimedCh <- index }
+func (m *mockScheduler) GetLocalBitfield() Bitfield { return m.local }
+func (m *mockScheduler) GetBlock(index, begin, length int) ([]byte, error) {
+	return nil, fmt.Errorf("GetBlock not implemented in mock")
+}
 
 // newTestPeer creates a loopback TCP connection and returns a configured
 // PeerConnection plus the remote net.Conn for the test to write messages into.
@@ -100,7 +109,7 @@ func singleBlockWork() (PieceWork, []byte) {
 // matching Piece. Returns the observed Request so callers can assert on it.
 func unchokeAndAwaitRequest(t *testing.T, remote net.Conn) message.Request {
 	t.Helper()
-	unchoke := message.NewUnChoke()
+	unchoke := message.NewUnchoke()
 	if _, err := unchoke.WriteTo(remote); err != nil {
 		t.Error("remote: failed to write unchoke:", err)
 		return message.Request{}
@@ -199,7 +208,7 @@ func TestRunUnChoke(t *testing.T) {
 
 	go func() {
 		doHandshake(t, remote, infoHash)
-		unchoke := message.NewUnChoke()
+		unchoke := message.NewUnchoke()
 		unchoke.WriteTo(remote)
 		remote.Close()
 	}()
@@ -232,8 +241,8 @@ func TestRunBitfield(t *testing.T) {
 
 	select {
 	case <-errCh:
-		if len(p.bitfield) == 0 || p.bitfield[0] != 0xFF {
-			t.Errorf("bitField = %v, want [0xFF]", p.bitfield)
+		if b := p.bitfield.Bytes(); len(b) == 0 || b[0] != 0xFF {
+			t.Errorf("bitField = %v, want [0xFF]", b)
 		}
 	case <-time.After(time.Second):
 		t.Error("timeout")
@@ -244,7 +253,7 @@ func TestRunHave(t *testing.T) {
 	var infoHash [20]byte
 	work, _ := singleBlockWork()
 	p, remote := newTestPeer(t, infoHash, newMock(work, true))
-	p.bitfield = make(Bitfield, 1)
+	p.bitfield = *NewBitfield(make([]byte, 1), 8)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

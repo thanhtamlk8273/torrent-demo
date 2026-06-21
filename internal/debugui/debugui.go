@@ -19,7 +19,6 @@ import (
 
 const (
 	stripWidth       = 40
-	maxFailedEntries = 200
 	refreshInterval  = 250 * time.Millisecond
 	rateTimeConstant = 3 * time.Second // debug-only: EWMA smoothing window for speed display
 )
@@ -31,17 +30,17 @@ type peerState struct {
 	done       []bool
 	doneCount  int
 
-	// debug-only: speed tracking, sampled and EWMA-smoothed in render().
+	// debug-only: download speed tracking, sampled and EWMA-smoothed in render().
 	bytesTotal     int64
 	bytesAtSample  int64
 	rateBps        float64
 	lastSampleTime time.Time
-}
 
-type failedEntry struct {
-	addr   string
-	reason string
-	at     time.Time
+	// debug-only: upload speed tracking, mirrors the download fields above.
+	upBytesTotal     int64
+	upBytesAtSample  int64
+	upRateBps        float64
+	upLastSampleTime time.Time
 }
 
 // UI is a debug-only tview dashboard. It implements peer.Reporter so it can
@@ -49,20 +48,25 @@ type failedEntry struct {
 type UI struct {
 	mu     sync.Mutex
 	active map[string]*peerState
-	failed []failedEntry
 	doneP  int
 	totalP int
 
-	// debug-only: global speed tracking, mirrors peerState's fields above.
+	// debug-only: global download speed tracking, mirrors peerState's fields above.
 	totalBytes     int64
 	bytesAtSample  int64
 	globalRateBps  float64
 	lastSampleTime time.Time
 
+	// debug-only: global upload speed tracking, mirrors the download fields above.
+	totalUpBytes     int64
+	upBytesAtSample  int64
+	globalUpRateBps  float64
+	upLastSampleTime time.Time
+
 	app          *tview.Application
 	pages        *tview.Pages
 	activeView   *tview.TextView
-	failedView   *tview.TextView
+	uploadView   *tview.TextView
 	progressView *tview.TextView
 	logView      *tview.TextView
 
@@ -87,8 +91,8 @@ func New() *UI {
 	ui.activeView = tview.NewTextView().SetDynamicColors(true)
 	ui.activeView.SetBorder(true).SetTitle(" Active Peers (debug) [Tab: logs] ")
 
-	ui.failedView = tview.NewTextView().SetDynamicColors(true)
-	ui.failedView.SetBorder(true).SetTitle(" Failed Peers (debug) ")
+	ui.uploadView = tview.NewTextView().SetDynamicColors(true)
+	ui.uploadView.SetBorder(true).SetTitle(" Upload (debug) ")
 
 	ui.progressView = tview.NewTextView().SetDynamicColors(true)
 	ui.progressView.SetBorder(true).SetTitle(" Progress (debug) ")
@@ -99,7 +103,7 @@ func New() *UI {
 
 	panels := tview.NewFlex().SetDirection(tview.FlexColumn).
 		AddItem(ui.activeView, 0, 1, false).
-		AddItem(ui.failedView, 0, 1, false)
+		AddItem(ui.uploadView, 0, 1, false)
 
 	dashboard := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(panels, 0, 1, false).
@@ -190,17 +194,17 @@ func (ui *UI) refreshLoop() {
 		case <-ui.stopRefresh:
 			return
 		case <-ticker.C:
-			active, failed, progress := ui.render()
+			active, upload, progress := ui.render()
 			ui.app.QueueUpdateDraw(func() {
 				ui.activeView.SetText(active)
-				ui.failedView.SetText(failed)
+				ui.uploadView.SetText(upload)
 				ui.progressView.SetText(progress)
 			})
 		}
 	}
 }
 
-func (ui *UI) render() (active, failed, progress string) {
+func (ui *UI) render() (active, upload, progress string) {
 	ui.mu.Lock()
 	defer ui.mu.Unlock()
 
@@ -211,6 +215,12 @@ func (ui *UI) render() (active, failed, progress string) {
 	ui.bytesAtSample = ui.totalBytes
 	ui.lastSampleTime = now
 
+	if !ui.upLastSampleTime.IsZero() {
+		ui.globalUpRateBps = ewmaRate(ui.globalUpRateBps, ui.totalUpBytes-ui.upBytesAtSample, now.Sub(ui.upLastSampleTime))
+	}
+	ui.upBytesAtSample = ui.totalUpBytes
+	ui.upLastSampleTime = now
+
 	addrs := make([]string, 0, len(ui.active))
 	for addr := range ui.active {
 		addrs = append(addrs, addr)
@@ -220,6 +230,10 @@ func (ui *UI) render() (active, failed, progress string) {
 	var b strings.Builder
 	if len(addrs) == 0 {
 		b.WriteString("(no active peers)\n")
+	}
+	var ub strings.Builder
+	if len(addrs) == 0 {
+		ub.WriteString("(no active peers)\n")
 	}
 	for _, addr := range addrs {
 		ps := ui.active[addr]
@@ -239,25 +253,26 @@ func (ui *UI) render() (active, failed, progress string) {
 		} else {
 			fmt.Fprintf(&b, "%s  (idle)  %s\n\n", tview.Escape(addr), formatRate(ps.rateBps))
 		}
+
+		if ps.upLastSampleTime.IsZero() {
+			ps.upLastSampleTime = now
+			ps.upBytesAtSample = ps.upBytesTotal
+		} else {
+			ps.upRateBps = ewmaRate(ps.upRateBps, ps.upBytesTotal-ps.upBytesAtSample, now.Sub(ps.upLastSampleTime))
+			ps.upBytesAtSample = ps.upBytesTotal
+			ps.upLastSampleTime = now
+		}
+		fmt.Fprintf(&ub, "%s  %s  (%s total)\n\n", tview.Escape(addr), formatRate(ps.upRateBps), formatBytes(ps.upBytesTotal))
 	}
 
-	var fb strings.Builder
-	if len(ui.failed) == 0 {
-		fb.WriteString("(none yet)\n")
-	}
-	for i := len(ui.failed) - 1; i >= 0; i-- {
-		e := ui.failed[i]
-		fmt.Fprintf(&fb, "%s  %s\n  %s\n\n", e.at.Format("15:04:05"), tview.Escape(e.addr), tview.Escape(e.reason))
-	}
+	progress = buildProgress(ui.doneP, ui.totalP, ui.globalRateBps, ui.globalUpRateBps)
 
-	progress = buildProgress(ui.doneP, ui.totalP, ui.globalRateBps)
-
-	return b.String(), fb.String(), progress
+	return b.String(), ub.String(), progress
 }
 
 // buildProgress renders the "done/total pieces" line with a small bar and
-// the current overall download speed.
-func buildProgress(done, total int, rateBps float64) string {
+// the current overall download/upload speeds.
+func buildProgress(done, total int, downRateBps, upRateBps float64) string {
 	if total == 0 {
 		return "(no progress yet)"
 	}
@@ -265,7 +280,7 @@ func buildProgress(done, total int, rateBps float64) string {
 	lit := done * barWidth / total
 	bar := strings.Repeat("█", lit) + strings.Repeat("░", barWidth-lit)
 	pct := float64(done) * 100 / float64(total)
-	return fmt.Sprintf("[green]%s[white]  %d/%d pieces (%.1f%%)  %s", bar, done, total, pct, formatRate(rateBps))
+	return fmt.Sprintf("[green]%s[white]  %d/%d pieces (%.1f%%)  ↓ %s  ↑ %s", bar, done, total, pct, formatRate(downRateBps), formatRate(upRateBps))
 }
 
 // ewmaRate folds a newly-observed instantaneous rate (deltaBytes over
@@ -291,6 +306,19 @@ func formatRate(bps float64) string {
 		return fmt.Sprintf("%.1f KB/s", bps/1024)
 	default:
 		return fmt.Sprintf("%.0f B/s", bps)
+	}
+}
+
+// formatBytes renders a byte count using the same binary-prefix units as
+// formatRate, for displaying running totals (e.g. bytes uploaded so far).
+func formatBytes(n int64) string {
+	switch {
+	case n >= 1024*1024:
+		return fmt.Sprintf("%.2f MB", float64(n)/(1024*1024))
+	case n >= 1024:
+		return fmt.Sprintf("%.1f KB", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%d B", n)
 	}
 }
 
@@ -378,17 +406,23 @@ func (ui *UI) PieceCompleted(addr string, index int) {
 	}
 }
 
-func (ui *UI) PieceFailed(addr, reason string) {
-	ui.mu.Lock()
-	defer ui.mu.Unlock()
-	ui.failed = append(ui.failed, failedEntry{addr: addr, reason: reason, at: time.Now()})
-	if len(ui.failed) > maxFailedEntries {
-		ui.failed = ui.failed[len(ui.failed)-maxFailedEntries:]
-	}
-}
+// PieceFailed is a no-op: the dedicated Failed Peers panel was retired in
+// favor of the Upload panel. Kept to satisfy peer.Reporter.
+func (ui *UI) PieceFailed(addr, reason string) {}
 
 func (ui *UI) PeerDisconnected(addr string, err error) {
 	ui.mu.Lock()
 	defer ui.mu.Unlock()
 	delete(ui.active, addr)
+}
+
+func (ui *UI) BlockSent(addr string, size int) {
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+	ps, ok := ui.active[addr]
+	if !ok {
+		return
+	}
+	ps.upBytesTotal += int64(size)
+	ui.totalUpBytes += int64(size)
 }

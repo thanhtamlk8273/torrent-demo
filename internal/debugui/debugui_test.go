@@ -58,11 +58,18 @@ func TestReporterLifecycle(t *testing.T) {
 	}
 	ui.mu.Unlock()
 
-	ui.PieceFailed(addr, "hash mismatch p9")
-	_, failed, _ := ui.render()
-	if failed == "(none yet)\n" {
-		t.Fatal("expected failed entry to appear in failed panel")
+	ui.PieceFailed(addr, "hash mismatch p9") // no-op; must not panic
+
+	ui.BlockSent(addr, 16384)
+	_, upload, _ := ui.render()
+	if upload == "(no active peers)\n" {
+		t.Fatal("expected connected peer to appear in upload panel")
 	}
+	ui.mu.Lock()
+	if ui.active[addr].upBytesTotal != 16384 {
+		t.Errorf("upBytesTotal = %d, want 16384", ui.active[addr].upBytesTotal)
+	}
+	ui.mu.Unlock()
 
 	ui.PeerDisconnected(addr, nil)
 	ui.mu.Lock()
@@ -136,12 +143,18 @@ func TestOnQuit(t *testing.T) {
 }
 
 func TestBuildProgress(t *testing.T) {
-	if got := buildProgress(0, 0, 0); got != "(no progress yet)" {
-		t.Errorf("buildProgress(0,0,0) = %q, want placeholder", got)
+	if got := buildProgress(0, 0, 0, 0); got != "(no progress yet)" {
+		t.Errorf("buildProgress(0,0,0,0) = %q, want placeholder", got)
 	}
-	got := buildProgress(5, 10, 2048)
-	if !strings.Contains(got, "5/10 pieces") || !strings.Contains(got, "50.0%") || !strings.Contains(got, "2.0 KB/s") {
-		t.Errorf("buildProgress(5,10,2048) = %q, want it to mention 5/10 pieces, 50.0%%, and 2.0 KB/s", got)
+	got := buildProgress(5, 10, 2048, 4096)
+	if !strings.Contains(got, "5/10 pieces") || !strings.Contains(got, "50.0%") {
+		t.Errorf("buildProgress(5,10,2048,4096) = %q, want it to mention 5/10 pieces and 50.0%%", got)
+	}
+	if !strings.Contains(got, "2.0 KB/s") {
+		t.Errorf("buildProgress(5,10,2048,4096) = %q, want it to mention download rate 2.0 KB/s", got)
+	}
+	if !strings.Contains(got, "4.0 KB/s") {
+		t.Errorf("buildProgress(5,10,2048,4096) = %q, want it to mention upload rate 4.0 KB/s", got)
 	}
 }
 
@@ -181,6 +194,28 @@ func TestSpeedTracking(t *testing.T) {
 	}
 	if global <= 0 {
 		t.Errorf("expected positive global rate after a block was saved, got %v", global)
+	}
+}
+
+func TestUploadSpeedTracking(t *testing.T) {
+	ui := New()
+	addr := "1.2.3.4:6881"
+	ui.PeerConnected(addr)
+	ui.render() // establish the initial sample baseline
+
+	ui.BlockSent(addr, 16384)
+	time.Sleep(50 * time.Millisecond)
+	ui.render()
+
+	ui.mu.Lock()
+	rate := ui.active[addr].upRateBps
+	global := ui.globalUpRateBps
+	ui.mu.Unlock()
+	if rate <= 0 {
+		t.Errorf("expected positive per-peer upload rate after a block was sent, got %v", rate)
+	}
+	if global <= 0 {
+		t.Errorf("expected positive global upload rate after a block was sent, got %v", global)
 	}
 }
 
@@ -230,17 +265,5 @@ func TestToggleLogView(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run() did not return after Stop()")
-	}
-}
-
-func TestFailedEntriesCapped(t *testing.T) {
-	ui := New()
-	for i := 0; i < maxFailedEntries+10; i++ {
-		ui.PieceFailed("addr", "reason")
-	}
-	ui.mu.Lock()
-	defer ui.mu.Unlock()
-	if len(ui.failed) != maxFailedEntries {
-		t.Errorf("len(failed) = %d, want %d", len(ui.failed), maxFailedEntries)
 	}
 }

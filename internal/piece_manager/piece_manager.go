@@ -18,11 +18,12 @@ const (
 )
 
 type PieceManager struct {
-	mu          sync.RWMutex
-	location    string
-	pieceStates []PieceState
-	metaInfo    metainfo.MetaInfo
-	layout      *TorrentLayout
+	mu            sync.RWMutex
+	location      string
+	pieceStates   []PieceState
+	metaInfo      metainfo.MetaInfo
+	layout        *TorrentLayout
+	localBitfield peer.Bitfield
 }
 
 func NewPieceManager(location string, mInfo metainfo.MetaInfo) (*PieceManager, error) {
@@ -47,8 +48,15 @@ func NewPieceManager(location string, mInfo metainfo.MetaInfo) (*PieceManager, e
 			pm.pieceStates[idx] = Done
 		}
 	}
+	pm.localBitfield = field
 
 	return pm, nil
+}
+
+func (pm *PieceManager) GetLocalBitfield() peer.Bitfield {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return pm.localBitfield
 }
 
 func (pm *PieceManager) GetWork(field peer.Bitfield) (peer.PieceWork, bool) {
@@ -86,6 +94,7 @@ func (pm *PieceManager) CompletePiece(index int, data []byte) error {
 		return err
 	}
 	pm.pieceStates[index] = Done
+	pm.localBitfield.Set(index)
 	return nil
 }
 
@@ -95,6 +104,22 @@ func (pm *PieceManager) UnclaimPiece(index int) {
 	if pm.pieceStates[index] == Claimed {
 		pm.pieceStates[index] = Unclaimed
 	}
+}
+
+func (pm *PieceManager) GetBlock(index, begin, length int) ([]byte, error) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if pm.pieceStates[index] != Done {
+		return []byte{}, fmt.Errorf("Do not have requested piece %d", index)
+	}
+	piece, err := pm.layout.readPiece(index)
+	if err != nil {
+		return []byte{}, fmt.Errorf("Do not have requested piece %d", index)
+	}
+	if begin < 0 || begin+length > len(piece) {
+		return []byte{}, fmt.Errorf("GetBlock: out of range index=%d begin=%d length=%d", index, begin, length)
+	}
+	return piece[begin : begin+length], nil
 }
 
 func (pm *PieceManager) Progress() (done, total int) {
@@ -109,16 +134,17 @@ func (pm *PieceManager) Progress() (done, total int) {
 }
 
 func (pm *PieceManager) verifyTorrent() (peer.Bitfield, error) {
-	field := peer.Bitfield{}
+	pieceCount := int(pm.layout.piecesCount)
+	field := peer.NewBitfield(make([]byte, (pieceCount+7)/8), pieceCount)
 	pieces := pm.metaInfo.Info.Common().Pieces
 	for idx := range pm.layout.piecesCount {
 		pieceData, err := pm.layout.readPiece(int(idx))
 		if err != nil {
-			return nil, fmt.Errorf("verifyTorrent: readPiece bad idx %d", idx)
+			return peer.Bitfield{}, fmt.Errorf("verifyTorrent: readPiece bad idx %d", idx)
 		}
 		expected, ok := getHash(pieces, idx)
 		if !ok {
-			return nil, fmt.Errorf("verifyTorrent: unable to find expectedHash %d", idx)
+			return peer.Bitfield{}, fmt.Errorf("verifyTorrent: unable to find expectedHash %d", idx)
 		}
 		hash := sha1.Sum(pieceData)
 		if !bytes.Equal(hash[:], expected[:]) {
@@ -126,7 +152,7 @@ func (pm *PieceManager) verifyTorrent() (peer.Bitfield, error) {
 		}
 		field.Set(int(idx))
 	}
-	return field, nil
+	return *field, nil
 }
 
 func getHash(pieces []byte, idx int) ([20]byte, bool) {

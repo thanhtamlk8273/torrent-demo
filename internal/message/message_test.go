@@ -101,7 +101,7 @@ func testSimpleRoundTrip(t *testing.T, name string, msg interface {
 }
 
 func TestChoke_RoundTrip(t *testing.T)   { c := NewChoke(); testSimpleRoundTrip(t, "Choke", &c) }
-func TestUnChoke_RoundTrip(t *testing.T) { u := NewUnChoke(); testSimpleRoundTrip(t, "UnChoke", &u) }
+func TestUnChoke_RoundTrip(t *testing.T) { u := NewUnchoke(); testSimpleRoundTrip(t, "UnChoke", &u) }
 func TestInterested_RoundTrip(t *testing.T) {
 	i := NewInterested()
 	testSimpleRoundTrip(t, "Interested", &i)
