@@ -2,6 +2,7 @@ package peer
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"strconv"
 	"time"
@@ -45,7 +46,11 @@ type Reporter interface {
 }
 
 type PeerConnection struct {
-	conn *net.TCPConn
+	tag string
+
+	ipPort    string
+	conn      *net.TCPConn
+	connected bool
 
 	lastAliveTime time.Time
 	infoHash      [20]byte
@@ -54,7 +59,15 @@ type PeerConnection struct {
 	leecher Leecher
 	seeder  Seeder
 
-	reporter Reporter
+	// Snapshot of each child's cumulative byte counter captured on the last
+	// speed sample, so a rate can be derived from the delta.
+	lastDownBytes  int64
+	lastUpBytes    int64
+	lastDownSample time.Time
+	lastUpSample   time.Time
+
+	managerChan chan<- PeerEvent
+	reporter    Reporter
 }
 
 // SetReporter attaches a debug-only observer for this connection's lifecycle
@@ -65,19 +78,18 @@ func (p *PeerConnection) SetReporter(r Reporter) {
 	p.leecher.reporter = r
 }
 
-func NewPeerConnection(ip string, port int, infoHash, peerId [20]byte, scheduler PieceScheduler) (PeerConnection, error) {
-	dialer := net.Dialer{Timeout: kDialTimeout}
-	conn, err := dialer.Dial("tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
-	if err != nil {
-		return PeerConnection{}, err
-	}
+func NewPeerConnection(tag string, ip string, port int, infoHash, peerId [20]byte, managerChan chan<- PeerEvent, scheduler PieceScheduler) (PeerConnection, error) {
 	return PeerConnection{
-		conn:          conn.(*net.TCPConn),
+		tag:           tag,
+		ipPort:        net.JoinHostPort(ip, strconv.Itoa(port)),
+		conn:          nil,
 		lastAliveTime: time.Now(),
 		infoHash:      infoHash,
 		peerId:        peerId,
+		managerChan:   managerChan,
 		leecher: Leecher{
-			conn:             conn.(*net.TCPConn),
+			tag:              tag,
+			conn:             nil,
 			isChoking:        true,
 			amInterested:     false,
 			bitfieldSize:     scheduler.GetLocalBitfield().n,
@@ -85,10 +97,11 @@ func NewPeerConnection(ip string, port int, infoHash, peerId [20]byte, scheduler
 			currentPiece:     nil,
 			nextIdx:          0,
 			nbParallelChunks: 0,
+			managerChan:      managerChan,
 			scheduler:        scheduler,
 		},
 		seeder: Seeder{
-			conn:          conn.(*net.TCPConn),
+			conn:          nil,
 			amChoking:     true,
 			isInterested:  false,
 			localBitfield: scheduler.GetLocalBitfield(),
@@ -97,17 +110,31 @@ func NewPeerConnection(ip string, port int, infoHash, peerId [20]byte, scheduler
 	}, nil
 }
 
-func (p *PeerConnection) connect() error {
+func (p *PeerConnection) Connect() error {
+	dialer := net.Dialer{Timeout: kDialTimeout}
+	conn, err := dialer.Dial("tcp", p.ipPort)
+	if err != nil {
+		return err
+	}
+	p.conn = conn.(*net.TCPConn)
+	if err := p.conn.SetDeadline(time.Now().Add(kHandshakeTimeout)); err != nil {
+		return err
+	}
 	if err := sendHandshake(p.conn, p.infoHash, p.peerId); err != nil {
 		return err
 	}
 	if err := receiveHandshake(p.conn, p.infoHash); err != nil {
 		return err
 	}
+	p.connected = true
 	return nil
 }
 
 func (p *PeerConnection) Run(ctx context.Context) (retErr error) {
+	if !p.connected {
+		return fmt.Errorf("PeerConnection::Run: Not connected yet")
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer func() {
@@ -115,12 +142,6 @@ func (p *PeerConnection) Run(ctx context.Context) (retErr error) {
 		p.leecher.shutdown()
 	}()
 
-	if err := p.conn.SetDeadline(time.Now().Add(kHandshakeTimeout)); err != nil {
-		return err
-	}
-	if err := p.connect(); err != nil {
-		return err
-	}
 	p.leecher.init()
 	p.seeder.init()
 
@@ -147,6 +168,7 @@ func (p *PeerConnection) Run(ctx context.Context) (retErr error) {
 	for {
 		select {
 		case <-ctx.Done():
+			p.sendClosedEvent()
 			return ctx.Err()
 		case msg := <-recvMsg:
 			p.lastAliveTime = time.Now()
@@ -158,6 +180,14 @@ func (p *PeerConnection) Run(ctx context.Context) (retErr error) {
 			p.seeder.advance()
 			p.leecher.advance()
 		}
+	}
+}
+
+func (p *PeerConnection) sendClosedEvent() {
+	p.managerChan <- PeerEvent{
+		tag:     p.tag,
+		kind:    ConnectionClosed,
+		payload: nil,
 	}
 }
 
@@ -202,4 +232,49 @@ func (p *PeerConnection) keepAliveLoop(ctx context.Context) {
 			sendKeepAlive(p.conn)
 		}
 	}
+}
+
+// getDownloadSpeed returns bytes/sec measured over the interval since the last
+// call: it advances the sampling state, so it must only be called from a single
+// goroutine (the PeerManager). The first call sets the baseline and returns 0.
+func (p *PeerConnection) getDownloadSpeed() int {
+	if !p.connected {
+		return 0
+	}
+	now := time.Now()
+	cur := p.leecher.bytesDownloaded()
+	if p.lastDownSample.IsZero() {
+		p.lastDownSample = now
+		p.lastDownBytes = cur
+		return 0
+	}
+	elapsed := now.Sub(p.lastDownSample).Seconds()
+	delta := cur - p.lastDownBytes
+	p.lastDownSample = now
+	p.lastDownBytes = cur
+	if elapsed <= 0 {
+		return 0
+	}
+	return int(float64(delta) / elapsed)
+}
+
+func (p *PeerConnection) getUploadSpeed() int {
+	if !p.connected {
+		return 0
+	}
+	now := time.Now()
+	cur := p.seeder.bytesUploaded()
+	if p.lastUpSample.IsZero() {
+		p.lastUpSample = now
+		p.lastUpBytes = cur
+		return 0
+	}
+	elapsed := now.Sub(p.lastUpSample).Seconds()
+	delta := cur - p.lastUpBytes
+	p.lastUpSample = now
+	p.lastUpBytes = cur
+	if elapsed <= 0 {
+		return 0
+	}
+	return int(float64(delta) / elapsed)
 }

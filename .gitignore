@@ -220,6 +220,7 @@ downloads/
 .claude
 .antigravitycli
 plan.md
+graphify-out
 
 # End of https://www.toptal.com/developers/gitignore/api/go,python,bittorrent,linux
 

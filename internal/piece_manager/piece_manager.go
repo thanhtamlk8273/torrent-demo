@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"fmt"
+	"slices"
 	"sync"
 	"torrent-demo/internal/metainfo"
 	"torrent-demo/internal/peer"
@@ -153,6 +154,30 @@ func (pm *PieceManager) verifyTorrent() (peer.Bitfield, error) {
 		field.Set(int(idx))
 	}
 	return *field, nil
+}
+
+func (pm *PieceManager) GetNextPieces(availability []int) []int {
+	ranked := []struct {
+		idx   int
+		count int
+	}{}
+	for idx, count := range availability {
+		if !pm.localBitfield.Has(idx) {
+			ranked = append(ranked, struct {
+				idx   int
+				count int
+			}{idx, count})
+		}
+	}
+	slices.SortFunc(ranked, func(a, b struct{ idx, count int }) int {
+		return a.count - b.count // ascending: rarest first
+	})
+
+	indices := make([]int, len(ranked))
+	for i, r := range ranked {
+		indices[i] = r.idx
+	}
+	return indices
 }
 
 func getHash(pieces []byte, idx int) ([20]byte, bool) {
