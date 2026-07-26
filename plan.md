@@ -9,12 +9,12 @@ mechanisms. Rough effort = "focused sessions" (~one solid evening each).
 - PieceManager + per-piece scheduler (claim/unclaim/complete), file layout
 - TCP peer protocol: handshake, bitfield, piece download + SHA1 verify
 - Multi-peer downloading with a bounded active pool and waiting-peer address book
-- Block request pipelining (up to 8 in flight per peer)
+- Block request pipelining (currently 8 in flight per peer)
 - Basic upload/seeding path (`Bitfield`, `Have`, `Unchoke`, `Request` → `Piece`)
 - Startup recheck/resume by hashing existing payload pieces
 - Debug-only tview dashboard with live download/upload speed
-- Unit tests across the core packages (peer tests need reconciliation after the
-  current API refactor; see stabilization)
+- Unit tests across the core packages (`go test ./...` passes after the exploratory
+  implementation was reverted)
 - **Real-world end-to-end validation:** downloaded a 13,674,576,509-byte,
   6,521-piece payload and independently rehashed every piece against the `.torrent`;
   6,521/6,521 matched with zero corruption
@@ -24,9 +24,14 @@ This is the line for "I actually understand BitTorrent." Stop here.
 
 1. **Peer I/O + pipelining**
    - [x] Keep multiple block requests in flight per peer (currently 8).
+   - [ ] Restore the experimentally validated 64-request window. A real-swarm run
+     improved from roughly 2–3 MB/s to 7–10 MB/s; 128 requests added little over 64.
    - [ ] Serialize every socket write through one owner/channel; current leecher,
      seeder, and keepalive paths can write concurrently.
    - [ ] Make write failures terminate the connection and release claimed work.
+   - [ ] Later optimization: let one connection pipeline blocks across two or more
+     pieces so its request window does not drain at every piece boundary. Do not
+     block the first functional GUI on this.
 2. **Rarest-first piece selection**
    - [x] Calculate piece availability and produce a rarest-first ranking.
    - [ ] Connect that ranking to the scheduler that actually claims work; `GetWork`
@@ -43,10 +48,116 @@ This is the line for "I actually understand BitTorrent." Stop here.
    - [ ] Implement reciprocation, upload-slot limits, and optimistic unchoke.
    - [ ] Exercise the upload path between two instances of this client.
 
-## Next target — stabilization gate
+## Current direction — right shape + functional GUI
 
-Do this before GUI or multiple simultaneous torrents. The engine has demonstrated
-correct bytes at scale; now make lifecycle and completion behavior deterministic.
+Freeze throughput tuning after restoring the measured 64-request baseline. In the
+real swarm, 32 → 64 requests per peer produced a large gain (roughly 7–10 MB/s
+overall), while 64 → 128 produced little additional value. The exploratory code was
+reverted after recording the result, so the current source is back at 8. The
+remaining gap with mature clients is understood as future work (multi-piece request
+pipelining, better peer admission/quality, more transports/extensions), not a reason
+to keep min-maxing `peer.go` before the application has the right outer shape.
+
+- [ ] Introduce a small `TorrentSession` boundary that owns the PieceManager,
+  PeerManager, lifecycle, and progress aggregation.
+- [ ] Expose commands such as start/stop (then pause/resume/remove when their
+  semantics are real) without exposing manager queues, bitfields, or goroutines.
+- [ ] Expose immutable session and peer snapshots suitable for both the debug TUI
+  and a GUI.
+- [ ] Build the first desktop frontend with Wails v2 + React + TypeScript.
+- [ ] First GUI slice: open a `.torrent`, start/stop it, show overall progress and
+  download/upload rates, active peer count, peer table, and diagnostic logs.
+- [ ] Keep the GUI dependent only on the session command/snapshot API so later
+  scheduling and peer-protocol improvements remain internal.
+
+Do not resume throughput tuning unless a correctness issue appears or a measured
+engine limitation blocks the GUI/session design.
+
+## Next-session handoff — findings from the reverted experiment
+
+The implementation used to obtain these results was intentionally reverted. Rebuild
+the useful parts in small, reviewed slices instead of restoring the experiment as one
+large patch.
+
+### Small fixes worth restoring first
+
+- [ ] Set the per-peer request window from 8 to **64** and keep it there unless a
+  repeatable benchmark disproves the real-swarm result. Do not use 128 by default.
+- [ ] Announce the real tracker `left` value from verified local pieces, including
+  the short final piece. This requires constructing/rechecking `PieceManager` before
+  announcing. Add visible verification progress or persisted resume state because
+  hashing a 13.7 GB payload otherwise looks like a startup hang.
+- [ ] Generate an honest `-TD0001-` peer ID with random per-process suffix bytes.
+  Spoofing qBittorrent (`-qB5000-`) changed the connected count by only one peer,
+  which is normal run-to-run variance; unknown client identity was not the bottleneck.
+- [ ] Make the wire reader consume and ignore unsupported message payloads while
+  keeping the stream aligned, with a bounded payload size (the experiment used
+  1 MiB). A live run observed **zero** unsupported messages, so treat this as protocol
+  robustness, not a peer-count fix.
+- [ ] Keep peer telemetry as monotonic downloaded/uploaded byte counters. Calculate
+  rates centrally from counter deltas and sample time; peers should not publish
+  independently calculated instantaneous rates.
+- [ ] Clone bitfields at ownership/snapshot boundaries. Shallow copies are fine only
+  while the shared backing bytes are provably immutable.
+
+### PeerManager policy to implement deliberately
+
+- [ ] Do not permanently remove a known peer merely because it reached a failure
+  count. Keep its profile and use exponential retry backoff capped at **5 minutes**.
+- [ ] Give a newly active peer an approximately **3-minute proof/grace window**,
+  then revisit usefulness every **1 minute**. A 15-second manager tick is adequate
+  scheduling resolution; do not turn each condition into another stored peer state.
+- [ ] New peers and peers with no trustworthy bitfield need an exploration path.
+  Treat their availability optimistically for admission (conceptually all ones),
+  and allow a stale last-known bitfield to become speculative again no more often
+  than about every **5 minutes**. PeerManager owns this refresh policy; PieceManager
+  remains responsible for rarest-first piece ranking/claiming.
+- [ ] Deduplicate admission candidates, enforce the active capacity while admitting,
+  and make connection replacement atomic from the manager loop.
+- [ ] Identify duplicate live connections by the handshake peer ID. If the same peer
+  connects again, replace only the connection and reset connection-local observations;
+  retain the peer profile/history. Never do the inbound handshake inside the manager
+  event loop.
+- [ ] Prefer terminal connection events over the temporary `IsStopped` polling used
+  in the experiment, but keep the manager model small: active/waiting plus retry
+  metadata, not a large peer state machine.
+
+### Inbound/upload path to rebuild
+
+- [ ] Add a configurable listen/announce port (the experiment used 6881).
+- [ ] Accept TCP connections in a listener goroutine; perform each BitTorrent
+  handshake in a short-lived worker with a deadline and a bounded number of pending
+  handshakes (the experiment used 32), then send only validated connections and their
+  remote peer IDs into the manager channel.
+- [ ] Reject self-connections and close rejected/abandoned sockets on every path.
+  Exercise duplicate-peer replacement and cancellation under the race detector.
+- [ ] Test seeder first, wait briefly for it to listen, then start the leecher. Local
+  testing proved the upload code can unchoke and serve blocks. Public inbound traffic
+  still requires the OS firewall and router/NAT to allow/forward the chosen port;
+  successful outbound downloading/uploading does not prove inbound reachability.
+
+### Measurements to remember
+
+- The test torrent exposed about 188 tracker candidates, but one observed run produced
+  only 16 successful handshakes and 15 active peers. Of 93 pre-handshake failures:
+  77 timed out, 10 were refused, 3 ended with EOF, 2 reset, and 1 was other.
+- Tolerating unsupported messages did not increase the live count in that run.
+- qBittorrent's larger count/rate is therefore more plausibly connection quality,
+  inbound reachability, protocol/transports, and scheduling maturity than a simple
+  client-ID rejection.
+- One connection currently owns one `currentPiece`. Near a piece boundary its request
+  window drains; mature clients pipeline blocks from multiple pieces on one TCP
+  connection. Park this optimization until after `TorrentSession` and the first GUI.
+- Multiple peers downloading the same block/piece belongs in endgame mode, not normal
+  throughput tuning.
+
+## Stabilization gate
+
+Do the lifecycle-critical parts while shaping the session boundary. The engine has
+demonstrated correct bytes at scale; now make lifecycle and completion behavior
+deterministic. The first GUI does not need to wait for every rarest-first, endgame,
+or tit-for-tat improvement, but it must not reach through the session API into peer
+internals.
 
 - [ ] **Peer lifecycle events:** a peer owns `dialing → handshaking → running → dead`
   and emits exactly one terminal event (`ConnectionFailed` or `ConnectionClosed`)
@@ -70,8 +181,8 @@ correct bytes at scale; now make lifecycle and completion behavior deterministic
   claims exactly once.
 - [ ] **Shutdown hygiene:** stop tickers, close/unblock socket goroutines, make
   shutdown idempotent, and wait for owned goroutines where required.
-- [ ] **Tests green after refactor:** reconcile stale `PeerConnection.Run`/`PeerStats`
-  tests, add manager transition/invariant tests, then pass `go test ./...`.
+- [ ] **Tests stay green through the refactor:** add manager
+  transition/invariant tests and keep `go test ./...` passing.
 - [ ] **Concurrency validation:** pass `go test -race ./...` and repeated
   connect/fail/EOF/cancel stress tests without races, leaks, deadlocks, or stuck slots.
 - [ ] **Tail test:** repeatedly finish a controlled swarm from “few pieces left” and
@@ -87,8 +198,9 @@ correct bytes at scale; now make lifecycle and completion behavior deterministic
 - The engine exposes a small session-facing snapshot/command API suitable for a GUI,
   without leaking peer internals.
 
-At that point the single-download engine is a credible v1 core. GUI and multiple
-downloads become the next layer, not fixes for unfinished lifecycle behavior.
+At that point the single-download engine is a credible v1 core. The functional GUI
+can already exist on the stable session boundary; multiple simultaneous downloads
+remain a later layer.
 
 **Ownership debt — NON-NEGOTIABLE:** after the peer rewrite + PeerManager, rewrite
 `UnmarshalBencode` (internal/tracker_client/client.go) by hand. It's the one piece of
@@ -189,8 +301,8 @@ commandChan) lives at that seam.
   claims the first available piece by index.
 - “Zero speed” eviction treats healthy-but-choked/useful peers as stalled.
 - Socket writes remain unsynchronized across leecher, seeder, and keepalive paths.
-- `PeerConnection` tests still target the pre-refactor `Run(ctx)` and `PeerStats`
-  API, so the full test suite does not currently compile cleanly.
+- The current reverted baseline passes `go test ./...`; preserve that while fixing
+  the lifecycle issues above.
 
 ## Parked — future optional mini-projects
 Each is roughly its own thing with its own budget. Pick up only if the specific itch is
@@ -210,8 +322,8 @@ still there. NOT part of v1.0.
   from peers via the extension protocol. Mostly negotiation plumbing.
 
 ## Notes
-- Frontend, when wanted: Go backend exposes a few REST endpoints (add/pause/remove) +
-  one **SSE** stream for live state (reuse the `Reporter`/progress data the debug TUI
-  already produces). React on top — handed off, not hand-written here.
+- Frontend: Wails v2 desktop shell with React + TypeScript. Prefer direct Wails
+  bindings for commands and events/snapshots for live state; add REST + SSE only if
+  a browser/remote-control frontend becomes a real requirement.
 - PeerManager extraction: do it only if the peer code gets annoying to work with, not on
   principle. Architecture for its own sake is the time-sink to avoid.
