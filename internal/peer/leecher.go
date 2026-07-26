@@ -24,11 +24,10 @@ type Leecher struct {
 
 	// downloadedBytes accumulates accepted block bytes (atomic); the parent
 	// connection reads it via bytesDownloaded to derive download speed.
-	downloadedBytes int64
+	downloadedBytes uint64
 
-	managerChan chan<- PeerEvent
-	scheduler   PieceScheduler
-	reporter    Reporter
+	scheduler PieceScheduler
+	reporter  Reporter
 }
 
 func (l *Leecher) init() {
@@ -67,24 +66,14 @@ func (l *Leecher) processMessage(msg message.Message) {
 		l.isChoking = false
 	case *message.Bitfield:
 		l.bitfield = *NewBitfield(m.Field, l.bitfieldSize)
-		l.managerChan <- PeerEvent{
-			tag:     l.tag,
-			kind:    BitfieldEvent,
-			payload: l.bitfield,
-		}
 	case *message.Have:
 		l.bitfield.Set(int(m.PieceIndex))
-		l.managerChan <- PeerEvent{
-			tag:     l.tag,
-			kind:    HaveEvent,
-			payload: int(m.PieceIndex),
-		}
 	case *message.Piece:
 		if l.currentPiece != nil {
 			if m.Index != uint32(l.currentPiece.index) {
 				// stale block for a piece we've moved on from; dropped silently
 			} else if l.currentPiece.saveBlock(m.Begin, m.Block) {
-				atomic.AddInt64(&l.downloadedBytes, int64(len(m.Block)))
+				atomic.AddUint64(&l.downloadedBytes, uint64(len(m.Block)))
 				if l.reporter != nil { // debug-only
 					l.reporter.BlockSaved(l.conn.RemoteAddr().String(), int(m.Begin)/kBlockSize, len(m.Block))
 				}
@@ -128,12 +117,6 @@ func (l *Leecher) requestNextChunk() bool {
 	l.nbParallelChunks += 1
 	l.nextIdx += 1
 	return true
-}
-
-// bytesDownloaded returns the cumulative accepted block bytes. Safe to call from
-// another goroutine.
-func (l *Leecher) bytesDownloaded() int64 {
-	return atomic.LoadInt64(&l.downloadedBytes)
 }
 
 func (l *Leecher) shutdown() {

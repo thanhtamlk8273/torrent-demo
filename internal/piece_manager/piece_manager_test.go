@@ -134,6 +134,23 @@ func TestCompletePieceMarksDoneAndAdvancesProgress(t *testing.T) {
 	}
 }
 
+func TestGetLocalBitfieldReturnsSnapshot(t *testing.T) {
+	pm := newTestPM(t)
+	before := pm.GetLocalBitfield()
+
+	if err := pm.CompletePiece(0, make([]byte, 10)); err != nil {
+		t.Fatalf("CompletePiece: %v", err)
+	}
+	after := pm.GetLocalBitfield()
+
+	if before.Has(0) {
+		t.Fatal("previous local bitfield snapshot changed after piece completion")
+	}
+	if !after.Has(0) {
+		t.Fatal("new local bitfield snapshot does not include completed piece")
+	}
+}
+
 // A failed write reverts a claimed piece to Unclaimed so another peer can
 // retry it, rather than leaking the slot.
 func TestCompletePieceWriteErrorRevertsClaimedPiece(t *testing.T) {

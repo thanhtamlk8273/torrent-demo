@@ -22,8 +22,8 @@ type mockScheduler struct {
 
 func newMock(work PieceWork, hasWork bool) *mockScheduler {
 	return &mockScheduler{
-		work:        work,
-		hasWork:     hasWork,
+		work:    work,
+		hasWork: hasWork,
 		// 8-piece domain with nothing owned: Any() is false (so connect()
 		// won't send a bitfield) but Size() gives remote bitfields a count.
 		local:       *NewBitfield(make([]byte, 1), 8),
@@ -37,15 +37,17 @@ func (m *mockScheduler) CompletePiece(index int, _ []byte) error {
 	m.completedCh <- index
 	return nil
 }
-func (m *mockScheduler) UnclaimPiece(index int) { m.unclaimedCh <- index }
+func (m *mockScheduler) UnclaimPiece(index int)     { m.unclaimedCh <- index }
 func (m *mockScheduler) GetLocalBitfield() Bitfield { return m.local }
 func (m *mockScheduler) GetBlock(index, begin, length int) ([]byte, error) {
 	return nil, fmt.Errorf("GetBlock not implemented in mock")
 }
 
-// newTestPeer creates a loopback TCP connection and returns a configured
-// PeerConnection plus the remote net.Conn for the test to write messages into.
-func newTestPeer(t *testing.T, infoHash [20]byte, sched *mockScheduler) (*PeerConnection, net.Conn) {
+// newTestPeer starts a loopback listener and returns a PeerConnection wired to
+// dial it, plus a channel that yields the server-accepted remote conn once
+// Run's connect() dials in. seam #1 in peer.go wires p.conn into
+// leecher.conn/seeder.conn after the dial, so tests never inject conn directly.
+func newTestPeer(t *testing.T, infoHash [20]byte, sched *mockScheduler) (*PeerConnection, <-chan net.Conn) {
 	t.Helper()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -60,34 +62,77 @@ func newTestPeer(t *testing.T, infoHash [20]byte, sched *mockScheduler) (*PeerCo
 		if err != nil {
 			return
 		}
+		t.Cleanup(func() { c.Close() })
 		remoteCh <- c
 	}()
 
-	clientConn, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	remote := <-remoteCh
-	t.Cleanup(func() { remote.Close(); clientConn.Close() })
-
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	p := &PeerConnection{
-		conn:     clientConn.(*net.TCPConn),
-		infoHash: infoHash,
+		ctx:        ctx,
+		cancelFunc: cancel,
+		ipPort:     ln.Addr().String(),
+		infoHash:   infoHash,
 		leecher: Leecher{
-			conn:         clientConn.(*net.TCPConn),
 			isChoking:    true,
 			bitfieldSize: sched.GetLocalBitfield().n,
 			scheduler:    sched,
 		},
 		seeder: Seeder{
-			conn:          clientConn.(*net.TCPConn),
 			amChoking:     true,
 			localBitfield: sched.GetLocalBitfield(),
 			scheduler:     sched,
 		},
 	}
-	return p, remote
+	return p, remoteCh
+}
+
+func waitPeerStopped(t *testing.T, p *PeerConnection) {
+	t.Helper()
+	select {
+	case <-p.ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for peer to stop")
+	}
+}
+
+func TestPeerBitfieldStatsAreSnapshots(t *testing.T) {
+	p := &PeerConnection{
+		leecher: Leecher{bitfield: *NewBitfield(nil, 8)},
+	}
+	p.updateStats()
+
+	p.leecher.bitfield.Set(1)
+	snapshot := p.GetBitField()
+	if snapshot.Has(1) {
+		t.Fatal("published stats changed when the leecher bitfield changed")
+	}
+
+	snapshot.Set(2)
+	published := p.GetBitField()
+	if published.Has(2) {
+		t.Fatal("mutating GetBitField result changed the published stats")
+	}
+}
+
+// waitStats polls the peer's published PeerStats snapshot until pred matches,
+// the race-free seam for observing Run's fire-and-forget state changes.
+func waitStats(t *testing.T, p *PeerConnection, pred func(PeerStats) bool) PeerStats {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+			if s, ok := p.getStats(); ok && pred(s) {
+				return s
+			}
+		case <-deadline:
+			t.Fatal("timeout waiting for stats condition")
+			return PeerStats{}
+		}
+	}
 }
 
 // doHandshake simulates the remote peer's handshake response.
@@ -142,15 +187,12 @@ func TestHandshakeInfoHashMismatch(t *testing.T) {
 	var infoHash [20]byte
 	infoHash[0] = 0xAA
 
-	p, remote := newTestPeer(t, infoHash, newMock(PieceWork{}, false))
+	p, remoteCh := newTestPeer(t, infoHash, newMock(PieceWork{}, false))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	errCh := make(chan error, 1)
-	go func() { errCh <- p.Run(ctx) }()
+	p.Run()
 
 	go func() {
+		remote := <-remoteCh
 		var hs message.Handshake
 		hs.ReadFrom(remote)
 		var wrong [20]byte
@@ -159,145 +201,127 @@ func TestHandshakeInfoHashMismatch(t *testing.T) {
 		reply.WriteTo(remote)
 	}()
 
-	select {
-	case err := <-errCh:
-		if err == nil {
-			t.Error("expected error on info_hash mismatch, got nil")
-		}
-	case <-time.After(time.Second):
-		t.Error("timeout waiting for handshake error")
-	}
+	waitPeerStopped(t, p)
 }
-
-// runAndWait starts Run in a goroutine and returns a channel that receives
-// the error when Run exits. Cancelling ctx or closing the conn triggers exit.
-func runAndWait(ctx context.Context, p *PeerConnection) <-chan error {
-	ch := make(chan error, 1)
-	go func() { ch <- p.Run(ctx) }()
-	return ch
-}
-
-// State-change tests close the remote conn after sending the message,
-// then wait for Run to exit. Reading p.* AFTER Run exits is race-free
-// because the goroutine is gone — no concurrent writes.
 
 func TestRunChoke(t *testing.T) {
 	var infoHash [20]byte
 	work, _ := singleBlockWork()
-	p, remote := newTestPeer(t, infoHash, newMock(work, true))
+	p, remoteCh := newTestPeer(t, infoHash, newMock(work, true))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	errCh := runAndWait(ctx, p)
+	p.Run()
 
+	result := make(chan error, 1)
 	go func() {
+		remote := <-remoteCh
 		doHandshake(t, remote, infoHash)
 		choke := message.NewChoke()
-		choke.WriteTo(remote)
-		remote.Close() // EOF causes Run to exit after processing Choke
+		if _, err := choke.WriteTo(remote); err != nil {
+			result <- err
+			return
+		}
+		if err := remote.SetReadDeadline(time.Now().Add(400 * time.Millisecond)); err != nil {
+			result <- err
+			return
+		}
+		for {
+			msg, err := message.Read(remote)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					result <- nil
+					return
+				}
+				result <- err
+				return
+			}
+			if _, ok := msg.(*message.Request); ok {
+				result <- fmt.Errorf("received block request while peer was choked")
+				return
+			}
+		}
 	}()
 
-	select {
-	case <-errCh:
-		if !p.leecher.isChoking {
-			t.Error("expected isChoking = true after Choke")
-		}
-	case <-time.After(time.Second):
-		t.Error("timeout")
+	if err := <-result; err != nil {
+		t.Fatal(err)
 	}
 }
 
 func TestRunUnChoke(t *testing.T) {
 	var infoHash [20]byte
 	work, _ := singleBlockWork()
-	p, remote := newTestPeer(t, infoHash, newMock(work, true))
+	p, remoteCh := newTestPeer(t, infoHash, newMock(work, true))
 	p.leecher.isChoking = true
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	errCh := runAndWait(ctx, p)
+	p.Run()
 
+	requested := make(chan message.Request, 1)
 	go func() {
+		remote := <-remoteCh
 		doHandshake(t, remote, infoHash)
-		unchoke := message.NewUnchoke()
-		unchoke.WriteTo(remote)
-		remote.Close()
+		requested <- unchokeAndAwaitRequest(t, remote)
 	}()
 
 	select {
-	case <-errCh:
-		if p.leecher.isChoking {
-			t.Error("expected isChoking = false after UnChoke")
+	case req := <-requested:
+		if int(req.Index) != work.Index {
+			t.Errorf("requested index = %d, want %d", req.Index, work.Index)
 		}
-	case <-time.After(time.Second):
-		t.Error("timeout")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for request after unchoke")
 	}
 }
 
 func TestRunBitfield(t *testing.T) {
 	var infoHash [20]byte
 	work, _ := singleBlockWork()
-	p, remote := newTestPeer(t, infoHash, newMock(work, true))
+	p, remoteCh := newTestPeer(t, infoHash, newMock(work, true))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	errCh := runAndWait(ctx, p)
+	p.Run()
 
 	go func() {
+		remote := <-remoteCh
 		doHandshake(t, remote, infoHash)
 		bf := message.NewBitfield([]byte{0xFF})
 		bf.WriteTo(remote)
-		remote.Close()
 	}()
 
-	select {
-	case <-errCh:
-		if b := p.leecher.bitfield.Bytes(); len(b) == 0 || b[0] != 0xFF {
-			t.Errorf("bitField = %v, want [0xFF]", b)
-		}
-	case <-time.After(time.Second):
-		t.Error("timeout")
+	s := waitStats(t, p, func(s PeerStats) bool {
+		b := s.Bitfield.Bytes()
+		return len(b) > 0 && b[0] == 0xFF
+	})
+	if b := s.Bitfield.Bytes(); len(b) == 0 || b[0] != 0xFF {
+		t.Errorf("bitField = %v, want [0xFF]", b)
 	}
 }
 
 func TestRunHave(t *testing.T) {
 	var infoHash [20]byte
 	work, _ := singleBlockWork()
-	p, remote := newTestPeer(t, infoHash, newMock(work, true))
+	p, remoteCh := newTestPeer(t, infoHash, newMock(work, true))
 	p.leecher.bitfield = *NewBitfield(make([]byte, 1), 8)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	errCh := runAndWait(ctx, p)
+	p.Run()
 
 	go func() {
+		remote := <-remoteCh
 		doHandshake(t, remote, infoHash)
 		have := message.NewHave(3)
 		have.WriteTo(remote)
-		remote.Close()
 	}()
 
-	select {
-	case <-errCh:
-		if !p.leecher.bitfield.Has(3) {
-			t.Error("expected bit 3 set after Have(3)")
-		}
-	case <-time.After(time.Second):
-		t.Error("timeout")
-	}
+	waitStats(t, p, func(s PeerStats) bool { return s.Bitfield.Has(3) })
 }
 
 func TestRunPieceCompleteHashMatch(t *testing.T) {
 	var infoHash [20]byte
 	work, blockData := singleBlockWork()
 	sched := newMock(work, true)
-	p, remote := newTestPeer(t, infoHash, sched)
+	p, remoteCh := newTestPeer(t, infoHash, sched)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go p.Run(ctx)
+	p.Run()
 
 	go func() {
+		remote := <-remoteCh
 		doHandshake(t, remote, infoHash)
 		req := unchokeAndAwaitRequest(t, remote)
 		if req.Index != 0 {
@@ -323,13 +347,12 @@ func TestRunPieceCompleteHashMismatch(t *testing.T) {
 	var infoHash [20]byte
 	work, _ := singleBlockWork()
 	sched := newMock(work, true)
-	p, remote := newTestPeer(t, infoHash, sched)
+	p, remoteCh := newTestPeer(t, infoHash, sched)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go p.Run(ctx)
+	p.Run()
 
 	go func() {
+		remote := <-remoteCh
 		doHandshake(t, remote, infoHash)
 		unchokeAndAwaitRequest(t, remote)
 		badData := make([]byte, kBlockSize)
@@ -354,34 +377,27 @@ func TestRunPieceWrongIndexIgnored(t *testing.T) {
 	var infoHash [20]byte
 	work, blockData := singleBlockWork() // claims piece 0
 	sched := newMock(work, true)
-	p, remote := newTestPeer(t, infoHash, sched)
+	p, remoteCh := newTestPeer(t, infoHash, sched)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	errCh := runAndWait(ctx, p)
+	p.Run()
 
 	go func() {
+		remote := <-remoteCh
 		doHandshake(t, remote, infoHash)
 		// Send piece for index 99 — peer holds index 0, must ignore
 		piece := message.NewPiece(99, 0, blockData)
 		piece.WriteTo(remote)
-		remote.Close() // exit cleanly after the wrong-index piece
+		remote.Close() // exit cleanly after the wrong-index piece; leecher.shutdown() unclaims piece 0
 	}()
 
 	select {
-	case <-errCh:
-		// Run exited — safe to read state, no concurrent goroutine
-		select {
-		case <-sched.completedCh:
-			t.Error("CompletePiece should not be called for wrong index")
-		case idx := <-sched.unclaimedCh:
-			if idx != 0 {
-				t.Errorf("UnclaimPiece index = %d, want 0", idx)
-			}
-		default:
-			t.Error("UnclaimPiece should be called for in-flight work when the peer exits")
+	case <-sched.completedCh:
+		t.Error("CompletePiece should not be called for wrong index")
+	case idx := <-sched.unclaimedCh:
+		if idx != 0 {
+			t.Errorf("UnclaimPiece index = %d, want 0", idx)
 		}
 	case <-time.After(time.Second):
-		t.Error("timeout")
+		t.Error("timeout waiting for UnclaimPiece")
 	}
 }

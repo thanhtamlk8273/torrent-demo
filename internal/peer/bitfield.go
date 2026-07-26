@@ -1,30 +1,38 @@
 package peer
 
+import "torrent-demo/internal/mathutil"
+
 type Bitfield struct {
 	bits []byte
 	n    int
 }
 
 func NewBitfield(bits []byte, n int) *Bitfield {
-	return &Bitfield{bits, n}
+	if n < 0 {
+		panic("negative bitfield size")
+	}
+	size := mathutil.CeilDiv(n, 8)
+	ownedBits := make([]byte, size)
+	copy(ownedBits, bits)
+	return &Bitfield{ownedBits, n}
 }
 
-// Bytes returns the underlying bytes for serialization onto the wire.
+// Clone returns an independent snapshot of the bitfield.
+func (b Bitfield) Clone() Bitfield {
+	clonedBits := make([]byte, len(b.bits))
+	copy(clonedBits, b.bits)
+	return Bitfield{bits: clonedBits, n: b.n}
+}
+
+// Bytes returns an independent byte snapshot for serialization.
 func (b *Bitfield) Bytes() []byte {
-	return b.bits
+	bytes := make([]byte, len(b.bits))
+	copy(bytes, b.bits)
+	return bytes
 }
 
 func (b *Bitfield) Size() int {
 	return b.n
-}
-
-func (b *Bitfield) Extend(index int) {
-	if index < b.Size() {
-		return
-	}
-	newSize := index/8 + 1
-	b.bits = append(b.bits, make([]byte, newSize-len(b.bits))...)
-	b.n = index + 1
 }
 
 func (b *Bitfield) Has(index int) bool {
@@ -35,7 +43,6 @@ func (b *Bitfield) Has(index int) bool {
 }
 
 func (b *Bitfield) Set(index int) {
-	b.Extend(index)
 	b.bits[index/8] |= 1 << (7 - index%8)
 }
 

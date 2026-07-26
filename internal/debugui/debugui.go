@@ -14,6 +14,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+	"torrent-demo/internal/mathutil"
 	"torrent-demo/internal/peer"
 )
 
@@ -41,6 +42,26 @@ type peerState struct {
 	upBytesAtSample  int64
 	upRateBps        float64
 	upLastSampleTime time.Time
+
+	// debug-only: failed-piece tracking (hash mismatch / incomplete piece).
+	failCount      int
+	lastFailReason string
+}
+
+// peerRow is an immutable snapshot of one peer's state for a single render
+// pass, used to populate both the peer table and the detail pane.
+type peerRow struct {
+	addr           string
+	hasPiece       bool
+	pieceIndex     int
+	doneCount      int
+	blockCount     int
+	done           []bool
+	rateBps        float64
+	upRateBps      float64
+	upBytesTotal   int64
+	failCount      int
+	lastFailReason string
 }
 
 // UI is a debug-only tview dashboard. It implements peer.Reporter so it can
@@ -63,10 +84,14 @@ type UI struct {
 	globalUpRateBps  float64
 	upLastSampleTime time.Time
 
+	// selectedAddr is the peer currently highlighted in peerTable; the
+	// detail pane renders whichever row matches it.
+	selectedAddr string
+
 	app          *tview.Application
 	pages        *tview.Pages
-	activeView   *tview.TextView
-	uploadView   *tview.TextView
+	peerTable    *tview.Table
+	detailView   *tview.TextView
 	progressView *tview.TextView
 	logView      *tview.TextView
 
@@ -81,6 +106,8 @@ var _ peer.Reporter = (*UI)(nil) // debug-only
 const dashboardPage = "dashboard"
 const logPage = "log"
 
+var peerTableHeaders = []string{"PEER", "STATE", "PIECE", "BLOCKS", "↓ RATE", "↑ RATE", "↑ TOTAL", "FAILS"}
+
 // New builds the debug dashboard. Call Run to take over the terminal.
 func New() *UI {
 	ui := &UI{
@@ -88,25 +115,25 @@ func New() *UI {
 		stopRefresh: make(chan struct{}),
 	}
 
-	ui.activeView = tview.NewTextView().SetDynamicColors(true)
-	ui.activeView.SetBorder(true).SetTitle(" Active Peers (debug) [Tab: logs] ")
+	ui.peerTable = tview.NewTable().SetSelectable(true, false).SetFixed(1, 0)
+	ui.peerTable.SetBorder(true).SetTitle(" Peers (debug) [Tab: logs, Ctrl-L: redraw] ")
+	ui.peerTable.SetSelectionChangedFunc(ui.onPeerSelectionChanged)
+	ui.setPeerTableHeader()
 
-	ui.uploadView = tview.NewTextView().SetDynamicColors(true)
-	ui.uploadView.SetBorder(true).SetTitle(" Upload (debug) ")
+	ui.detailView = tview.NewTextView().SetDynamicColors(true)
+	ui.detailView.SetBorder(true).SetTitle(" Peer Detail (debug) ")
+	ui.detailView.SetText("(no peer selected)")
 
 	ui.progressView = tview.NewTextView().SetDynamicColors(true)
 	ui.progressView.SetBorder(true).SetTitle(" Progress (debug) ")
 
 	ui.logView = tview.NewTextView().SetDynamicColors(false).SetMaxLines(2000)
-	ui.logView.SetBorder(true).SetTitle(" Log (debug) [Tab: back to dashboard] ")
+	ui.logView.SetBorder(true).SetTitle(" Log (debug) [Tab: back to dashboard, Ctrl-L: redraw] ")
 	ui.logView.SetChangedFunc(func() { ui.app.Draw() })
 
-	panels := tview.NewFlex().SetDirection(tview.FlexColumn).
-		AddItem(ui.activeView, 0, 1, false).
-		AddItem(ui.uploadView, 0, 1, false)
-
 	dashboard := tview.NewFlex().SetDirection(tview.FlexRow).
-		AddItem(panels, 0, 1, false).
+		AddItem(ui.peerTable, 0, 1, true).
+		AddItem(ui.detailView, 9, 0, false).
 		AddItem(ui.progressView, 3, 0, false)
 
 	ui.pages = tview.NewPages().
@@ -115,12 +142,15 @@ func New() *UI {
 
 	ui.app = tview.NewApplication().SetRoot(ui.pages, true)
 	ui.app.SetInputCapture(ui.handleInput)
+	ui.app.SetFocus(ui.peerTable)
 
 	return ui
 }
 
-// handleInput intercepts Ctrl-C (tview's raw mode otherwise swallows SIGINT)
-// and Tab (toggles between the dashboard and the full-screen log view).
+// handleInput intercepts Ctrl-C (tview's raw mode otherwise swallows SIGINT),
+// Tab (toggles between the dashboard and the full-screen log view), and
+// Ctrl-L (forces a full screen redraw, the standard terminal convention for
+// recovering from a corrupted/torn frame, e.g. after a terminal resize).
 func (ui *UI) handleInput(event *tcell.EventKey) *tcell.EventKey {
 	switch event.Key() {
 	case tcell.KeyCtrlC:
@@ -130,6 +160,9 @@ func (ui *UI) handleInput(event *tcell.EventKey) *tcell.EventKey {
 		return nil
 	case tcell.KeyTab:
 		ui.toggleLogView()
+		return nil
+	case tcell.KeyCtrlL:
+		ui.app.Sync()
 		return nil
 	}
 	return event
@@ -143,8 +176,10 @@ func (ui *UI) toggleLogView() {
 
 	if showingLog {
 		ui.pages.SwitchToPage(logPage)
+		ui.app.SetFocus(ui.logView)
 	} else {
 		ui.pages.SwitchToPage(dashboardPage)
+		ui.app.SetFocus(ui.peerTable)
 	}
 }
 
@@ -194,17 +229,22 @@ func (ui *UI) refreshLoop() {
 		case <-ui.stopRefresh:
 			return
 		case <-ticker.C:
-			active, upload, progress := ui.render()
+			rows, progress := ui.render()
 			ui.app.QueueUpdateDraw(func() {
-				ui.activeView.SetText(active)
-				ui.uploadView.SetText(upload)
+				ui.updatePeerTable(rows)
+				ui.updateDetailView(rows)
 				ui.progressView.SetText(progress)
 			})
 		}
 	}
 }
 
-func (ui *UI) render() (active, upload, progress string) {
+// render samples per-peer and global transfer rates (an EWMA over
+// rateTimeConstant) and returns an immutable snapshot of every active peer,
+// sorted with active peers (downloading/uploading) first, plus the overall
+// progress line. It mutates rate-tracking state on ui and each peerState, so
+// repeated calls must be spaced out to get meaningful rates.
+func (ui *UI) render() (rows []peerRow, progress string) {
 	ui.mu.Lock()
 	defer ui.mu.Unlock()
 
@@ -235,14 +275,7 @@ func (ui *UI) render() (active, upload, progress string) {
 		return addrs[i] < addrs[j]
 	})
 
-	var b strings.Builder
-	if len(addrs) == 0 {
-		b.WriteString("(no active peers)\n")
-	}
-	var ub strings.Builder
-	if len(addrs) == 0 {
-		ub.WriteString("(no active peers)\n")
-	}
+	rows = make([]peerRow, 0, len(addrs))
 	for _, addr := range addrs {
 		ps := ui.active[addr]
 		if ps.lastSampleTime.IsZero() {
@@ -254,14 +287,6 @@ func (ui *UI) render() (active, upload, progress string) {
 			ps.lastSampleTime = now
 		}
 
-		if ps.hasPiece {
-			fmt.Fprintf(&b, "%s  piece %d  (%d/%d)  %s\n", tview.Escape(addr), ps.pieceIndex, ps.doneCount, len(ps.done), formatRate(ps.rateBps))
-			b.WriteString(buildStrip(ps.done))
-			b.WriteString("\n\n")
-		} else {
-			fmt.Fprintf(&b, "%s  (idle)  %s\n\n", tview.Escape(addr), formatRate(ps.rateBps))
-		}
-
 		if ps.upLastSampleTime.IsZero() {
 			ps.upLastSampleTime = now
 			ps.upBytesAtSample = ps.upBytesTotal
@@ -270,12 +295,149 @@ func (ui *UI) render() (active, upload, progress string) {
 			ps.upBytesAtSample = ps.upBytesTotal
 			ps.upLastSampleTime = now
 		}
-		fmt.Fprintf(&ub, "%s  %s  (%s total)\n\n", tview.Escape(addr), formatRate(ps.upRateBps), formatBytes(ps.upBytesTotal))
+
+		row := peerRow{
+			addr:           addr,
+			hasPiece:       ps.hasPiece,
+			pieceIndex:     ps.pieceIndex,
+			doneCount:      ps.doneCount,
+			blockCount:     len(ps.done),
+			rateBps:        ps.rateBps,
+			upRateBps:      ps.upRateBps,
+			upBytesTotal:   ps.upBytesTotal,
+			failCount:      ps.failCount,
+			lastFailReason: ps.lastFailReason,
+		}
+		if ps.hasPiece {
+			row.done = append([]bool(nil), ps.done...)
+		}
+		rows = append(rows, row)
 	}
 
 	progress = buildProgress(ui.doneP, ui.totalP, ui.globalRateBps, ui.globalUpRateBps)
+	progress += fmt.Sprintf("  peers: %d", len(addrs))
 
-	return b.String(), ub.String(), progress
+	return rows, progress
+}
+
+func (ui *UI) setPeerTableHeader() {
+	for col, h := range peerTableHeaders {
+		cell := tview.NewTableCell(h).
+			SetSelectable(false).
+			SetTextColor(tcell.ColorYellow).
+			SetAttributes(tcell.AttrBold)
+		ui.peerTable.SetCell(0, col, cell)
+	}
+}
+
+// onPeerSelectionChanged tracks which peer address is highlighted so the
+// detail pane can follow it even as rows are resorted on each refresh.
+func (ui *UI) onPeerSelectionChanged(row, column int) {
+	var addr string
+	if cell := ui.peerTable.GetCell(row, 0); cell != nil {
+		addr, _ = cell.GetReference().(string)
+	}
+	ui.mu.Lock()
+	ui.selectedAddr = addr
+	ui.mu.Unlock()
+}
+
+// updatePeerTable rebuilds the peer table from rows, re-selecting whichever
+// row matches the previously selected peer address (falling back to the
+// first row if that peer disappeared) so selection survives the resort.
+func (ui *UI) updatePeerTable(rows []peerRow) {
+	ui.peerTable.Clear()
+	ui.setPeerTableHeader()
+
+	ui.mu.Lock()
+	selected := ui.selectedAddr
+	ui.mu.Unlock()
+
+	if len(rows) == 0 {
+		ui.mu.Lock()
+		ui.selectedAddr = ""
+		ui.mu.Unlock()
+		return
+	}
+
+	selectedRow := -1
+	for i, row := range rows {
+		r := i + 1
+		state, piece, blocks := "idle", "—", "—"
+		if row.hasPiece {
+			state = "leeching"
+			piece = fmt.Sprintf("#%d", row.pieceIndex)
+			blocks = fmt.Sprintf("%d/%d", row.doneCount, row.blockCount)
+		}
+		values := []string{
+			row.addr,
+			state,
+			piece,
+			blocks,
+			formatRate(row.rateBps),
+			formatRate(row.upRateBps),
+			formatBytes(row.upBytesTotal),
+			fmt.Sprintf("%d", row.failCount),
+		}
+		for col, v := range values {
+			cell := tview.NewTableCell(v)
+			if col == len(values)-1 && row.failCount > 0 {
+				cell.SetTextColor(tcell.ColorRed)
+			}
+			ui.peerTable.SetCell(r, col, cell)
+		}
+		ui.peerTable.GetCell(r, 0).SetReference(row.addr)
+		if row.addr == selected {
+			selectedRow = r
+		}
+	}
+
+	if selectedRow == -1 {
+		selectedRow = 1
+	}
+	ui.peerTable.Select(selectedRow, 0)
+}
+
+// updateDetailView renders the block strip, totals, and failure info for
+// whichever peer is currently selected.
+func (ui *UI) updateDetailView(rows []peerRow) {
+	ui.mu.Lock()
+	selected := ui.selectedAddr
+	ui.mu.Unlock()
+
+	if selected == "" {
+		ui.detailView.SetText("(no peer selected)")
+		return
+	}
+
+	var row *peerRow
+	for i := range rows {
+		if rows[i].addr == selected {
+			row = &rows[i]
+			break
+		}
+	}
+	if row == nil {
+		ui.detailView.SetText("(peer disconnected)")
+		return
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n", tview.Escape(row.addr))
+	if row.hasPiece {
+		fmt.Fprintf(&b, "piece #%d  (%d/%d blocks)  %s\n", row.pieceIndex, row.doneCount, row.blockCount, formatRate(row.rateBps))
+		b.WriteString(buildStrip(row.done))
+		b.WriteString("\n")
+	} else {
+		fmt.Fprintf(&b, "idle  %s\n", formatRate(row.rateBps))
+	}
+	fmt.Fprintf(&b, "upload: %s  (%s total)\n", formatRate(row.upRateBps), formatBytes(row.upBytesTotal))
+	if row.failCount > 0 {
+		fmt.Fprintf(&b, "[red]failures: %d  last: %s[white]\n", row.failCount, tview.Escape(row.lastFailReason))
+	} else {
+		b.WriteString("failures: 0\n")
+	}
+	ui.detailView.SetText(b.String())
 }
 
 // buildProgress renders the "done/total pieces" line with a small bar and
@@ -342,7 +504,7 @@ func buildStrip(done []bool) string {
 	if width > stripWidth {
 		width = stripWidth
 	}
-	group := (n + width - 1) / width
+	group := mathutil.CeilDiv(n, width)
 
 	var b strings.Builder
 	for i := 0; i < width; i++ {
@@ -414,9 +576,19 @@ func (ui *UI) PieceCompleted(addr string, index int) {
 	}
 }
 
-// PieceFailed is a no-op: the dedicated Failed Peers panel was retired in
-// favor of the Upload panel. Kept to satisfy peer.Reporter.
-func (ui *UI) PieceFailed(addr, reason string) {}
+// PieceFailed records a failed piece attempt (hash mismatch or incomplete
+// piece) against the peer so it's visible in the peer table (FAILS column)
+// and the detail pane (last failure reason).
+func (ui *UI) PieceFailed(addr, reason string) {
+	ui.mu.Lock()
+	defer ui.mu.Unlock()
+	ps, ok := ui.active[addr]
+	if !ok {
+		return
+	}
+	ps.failCount++
+	ps.lastFailReason = reason
+}
 
 func (ui *UI) PeerDisconnected(addr string, err error) {
 	ui.mu.Lock()

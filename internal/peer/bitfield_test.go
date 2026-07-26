@@ -31,34 +31,62 @@ func TestBitfieldNewAndBytes(t *testing.T) {
 	}
 }
 
-func TestBitfieldExtend(t *testing.T) {
-	var b Bitfield
+func TestBitfieldConstructorOwnsInput(t *testing.T) {
+	raw := []byte{0x80}
+	b := NewBitfield(raw, 8)
 
-	b.Extend(0)
-	if len(b.bits) != 1 {
-		t.Errorf("expected 1 byte, got %d", len(b.bits))
+	raw[0] = 0
+	if !b.Has(0) {
+		t.Fatal("mutating constructor input changed the bitfield")
+	}
+}
+
+func TestBitfieldBytesReturnsSnapshot(t *testing.T) {
+	b := NewBitfield([]byte{0x80}, 8)
+
+	bytes := b.Bytes()
+	bytes[0] = 0
+	if !b.Has(0) {
+		t.Fatal("mutating Bytes result changed the bitfield")
+	}
+}
+
+func TestBitfieldCloneIsIndependent(t *testing.T) {
+	original := NewBitfield(nil, 8)
+	clone := original.Clone()
+
+	clone.Set(3)
+	if original.Has(3) {
+		t.Fatal("mutating clone changed the original bitfield")
 	}
 
-	b.Extend(7)
-	if len(b.bits) != 1 {
-		t.Errorf("expected 1 byte after extending to index 7, got %d", len(b.bits))
+	original.Set(5)
+	if clone.Has(5) {
+		t.Fatal("mutating original changed the cloned bitfield")
 	}
+}
 
-	b.Extend(8)
-	if len(b.bits) != 2 {
-		t.Errorf("expected 2 bytes after extending to index 8, got %d", len(b.bits))
-	}
-
-	// Extend to already covered index should be no-op
-	prev := len(b.bits)
-	b.Extend(8)
-	if len(b.bits) != prev {
-		t.Errorf("expected no-op extend, got %d", len(b.bits))
+func TestBitfieldConstructorAllocatesExactStorage(t *testing.T) {
+	for _, tc := range []struct {
+		bits int
+		want int
+	}{
+		{bits: 0, want: 0},
+		{bits: 1, want: 1},
+		{bits: 7, want: 1},
+		{bits: 8, want: 1},
+		{bits: 9, want: 2},
+		{bits: 16, want: 2},
+	} {
+		b := NewBitfield(nil, tc.bits)
+		if got := len(b.bits); got != tc.want {
+			t.Errorf("NewBitfield(nil, %d) allocated %d bytes, want %d", tc.bits, got, tc.want)
+		}
 	}
 }
 
 func TestBitfieldSetAndHas(t *testing.T) {
-	var b Bitfield
+	b := NewBitfield(nil, 64)
 
 	for _, index := range []int{0, 1, 7, 8, 15, 16, 63} {
 		b.Set(index)
@@ -69,7 +97,7 @@ func TestBitfieldSetAndHas(t *testing.T) {
 }
 
 func TestBitfieldSetDoesNotAffectNeighbors(t *testing.T) {
-	var b Bitfield
+	b := NewBitfield(nil, 8)
 	b.Set(4)
 
 	for i := range b.Size() {
@@ -83,7 +111,7 @@ func TestBitfieldSetDoesNotAffectNeighbors(t *testing.T) {
 }
 
 func TestBitfieldUnset(t *testing.T) {
-	var b Bitfield
+	b := NewBitfield(nil, 4)
 	b.Set(3)
 	b.Unset(3)
 	if b.Has(3) {
@@ -95,9 +123,9 @@ func TestBitfieldUnset(t *testing.T) {
 }
 
 func TestBitfieldComplete(t *testing.T) {
-	var b Bitfield
+	b := NewBitfield(nil, 10)
 
-	// Grow the domain to 10 with a single high bit, leaving gaps below it.
+	// Set a single high bit, leaving gaps below it.
 	b.Set(9)
 	if b.Complete() {
 		t.Error("should not be complete with bits 0-8 unset")
@@ -112,8 +140,7 @@ func TestBitfieldComplete(t *testing.T) {
 }
 
 func TestBitfieldHasOnEmptyBitfield(t *testing.T) {
-	var b Bitfield
-	b.Extend(7)
+	b := NewBitfield(nil, 8)
 	for i := range 8 {
 		if b.Has(i) {
 			t.Errorf("expected bit %d to be unset on zero bitfield", i)

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,7 +13,7 @@ import (
 	"time"
 	"torrent-demo/internal/debugui"
 	"torrent-demo/internal/metainfo"
-	"torrent-demo/internal/peer"
+	peermgr "torrent-demo/internal/peer_manager"
 	piecemanager "torrent-demo/internal/piece_manager"
 	"torrent-demo/internal/tracker_client"
 )
@@ -177,8 +178,8 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout)
 	defer cancel()
 
-	// debug-only: launch the tview dashboard and pipe stdout into its log
-	// pane so the existing fmt.Printf calls below keep working untouched.
+	// debug-only: launch the tview dashboard and pipe process output into its
+	// log pane so diagnostics cannot overwrite tcell's terminal screen.
 	var dbgUI *debugui.UI
 	if *debugFlag {
 		dbgUI = debugui.New()
@@ -188,12 +189,21 @@ func run() error {
 		}
 
 		origStdout := os.Stdout
+		origStderr := os.Stderr
+		origLogWriter := log.Writer()
 		r, w, perr := os.Pipe()
 		if perr != nil {
 			return fmt.Errorf("failed to set up debug UI: %w", perr)
 		}
 		os.Stdout = w
-		go io.Copy(dbgUI.LogWriter(), r)
+		os.Stderr = w
+		log.SetOutput(w)
+
+		copyDone := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(dbgUI.LogWriter(), r)
+			close(copyDone)
+		}()
 
 		uiDone := make(chan error, 1)
 		go func() { uiDone <- dbgUI.Run() }()
@@ -202,10 +212,15 @@ func run() error {
 			dbgUI.Stop()
 			<-uiDone
 			os.Stdout = origStdout
+			os.Stderr = origStderr
+			log.SetOutput(origLogWriter)
+			_ = w.Close()
+			<-copyDone
+			_ = r.Close()
 		}()
 	}
 
-	peerMgr := peer.NewPeerManager(meta.InfoHash, peerID, pieces, pieces)
+	peerMgr := peermgr.NewPeerManager(meta.InfoHash, peerID, pieces, pieces)
 	if dbgUI != nil { // debug-only
 		peerMgr.SetReporter(dbgUI)
 	}

@@ -31,9 +31,9 @@ func TestReporterLifecycle(t *testing.T) {
 	addr := "1.2.3.4:6881"
 
 	ui.PeerConnected(addr)
-	active, _, _ := ui.render()
-	if active == "(no active peers)\n" {
-		t.Fatal("expected connected peer to appear in active panel")
+	rows, _ := ui.render()
+	if len(rows) != 1 || rows[0].addr != addr {
+		t.Fatalf("expected connected peer to appear in rows, got %+v", rows)
 	}
 
 	ui.PieceStarted(addr, 7, 4)
@@ -58,12 +58,20 @@ func TestReporterLifecycle(t *testing.T) {
 	}
 	ui.mu.Unlock()
 
-	ui.PieceFailed(addr, "hash mismatch p9") // no-op; must not panic
+	ui.PieceFailed(addr, "hash mismatch p9")
+	ui.mu.Lock()
+	if ui.active[addr].failCount != 1 {
+		t.Errorf("failCount = %d, want 1", ui.active[addr].failCount)
+	}
+	if ui.active[addr].lastFailReason != "hash mismatch p9" {
+		t.Errorf("lastFailReason = %q, want %q", ui.active[addr].lastFailReason, "hash mismatch p9")
+	}
+	ui.mu.Unlock()
 
 	ui.BlockSent(addr, 16384)
-	_, upload, _ := ui.render()
-	if upload == "(no active peers)\n" {
-		t.Fatal("expected connected peer to appear in upload panel")
+	rows, _ = ui.render()
+	if len(rows) != 1 || rows[0].upBytesTotal != 16384 {
+		t.Fatalf("expected upload activity in rows, got %+v", rows)
 	}
 	ui.mu.Lock()
 	if ui.active[addr].upBytesTotal != 16384 {
@@ -77,6 +85,35 @@ func TestReporterLifecycle(t *testing.T) {
 		t.Error("expected peer removed from active map after disconnect")
 	}
 	ui.mu.Unlock()
+}
+
+func TestPieceFailedRecorded(t *testing.T) {
+	ui := New()
+	addr := "1.2.3.4:6881"
+	ui.PeerConnected(addr)
+
+	ui.PieceFailed(addr, "piece 9 hash mismatch")
+	ui.PieceFailed(addr, "piece 12 incomplete")
+
+	ui.mu.Lock()
+	ps := ui.active[addr]
+	if ps.failCount != 2 {
+		t.Errorf("failCount = %d, want 2", ps.failCount)
+	}
+	if ps.lastFailReason != "piece 12 incomplete" {
+		t.Errorf("lastFailReason = %q, want %q", ps.lastFailReason, "piece 12 incomplete")
+	}
+	ui.mu.Unlock()
+
+	rows, _ := ui.render()
+	if len(rows) != 1 || rows[0].failCount != 2 || rows[0].lastFailReason != "piece 12 incomplete" {
+		t.Fatalf("expected failure info in rendered row, got %+v", rows)
+	}
+}
+
+func TestPieceFailedUnknownPeer(t *testing.T) {
+	ui := New()
+	ui.PieceFailed("unknown:6881", "hash mismatch") // must not panic
 }
 
 // newTestUI returns a UI driven by a simulation screen, so Run/Stop can be
@@ -222,7 +259,7 @@ func TestUploadSpeedTracking(t *testing.T) {
 func TestSetProgress(t *testing.T) {
 	ui := New()
 	ui.SetProgress(3, 9)
-	_, _, progress := ui.render()
+	_, progress := ui.render()
 	if !strings.Contains(progress, "3/9 pieces") {
 		t.Errorf("render() progress = %q, want it to mention 3/9 pieces", progress)
 	}

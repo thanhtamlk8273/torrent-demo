@@ -57,7 +57,7 @@ func NewPieceManager(location string, mInfo metainfo.MetaInfo) (*PieceManager, e
 func (pm *PieceManager) GetLocalBitfield() peer.Bitfield {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
-	return pm.localBitfield
+	return pm.localBitfield.Clone()
 }
 
 func (pm *PieceManager) GetWork(field peer.Bitfield) (peer.PieceWork, bool) {
@@ -136,7 +136,7 @@ func (pm *PieceManager) Progress() (done, total int) {
 
 func (pm *PieceManager) verifyTorrent() (peer.Bitfield, error) {
 	pieceCount := int(pm.layout.piecesCount)
-	field := peer.NewBitfield(make([]byte, (pieceCount+7)/8), pieceCount)
+	field := peer.NewBitfield(nil, pieceCount)
 	pieces := pm.metaInfo.Info.Common().Pieces
 	for idx := range pm.layout.piecesCount {
 		pieceData, err := pm.layout.readPiece(int(idx))
@@ -162,7 +162,7 @@ func (pm *PieceManager) GetNextPieces(availability []int) []int {
 		count int
 	}{}
 	for idx, count := range availability {
-		if !pm.localBitfield.Has(idx) {
+		if pm.pieceStates[idx] == Unclaimed {
 			ranked = append(ranked, struct {
 				idx   int
 				count int
@@ -172,10 +172,11 @@ func (pm *PieceManager) GetNextPieces(availability []int) []int {
 	slices.SortFunc(ranked, func(a, b struct{ idx, count int }) int {
 		return a.count - b.count // ascending: rarest first
 	})
-
-	indices := make([]int, len(ranked))
-	for i, r := range ranked {
-		indices[i] = r.idx
+	indices := make([]int, 0)
+	for _, r := range ranked {
+		if r.count > 0 {
+			indices = append(indices, r.idx)
+		}
 	}
 	return indices
 }
