@@ -45,5 +45,5 @@ type Reporter interface {
 }
 
 type PieceBook interface {
-	GetNextPieces(availability []int) []int
+	SubmitAvailability([]int) []int
 }

@@ -218,7 +218,7 @@ func (pm *PeerManager) selectCandidates(bitfield peer.Bitfield, now time.Time) [
 		return []string{}
 	}
 	availability := pm.pieceAvailability(bitfield, now)
-	pieces := pm.book.GetNextPieces(availability)
+	pieces := pm.book.SubmitAvailability(availability)
 	// pm.logf("stage=piece-selection availability=%v pieces=%v", availability, pieces)
 	var tags []string
 	for _, piece := range pieces {

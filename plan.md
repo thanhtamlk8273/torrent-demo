@@ -26,9 +26,12 @@ This is the line for "I actually understand BitTorrent." Stop here.
    - [x] Keep multiple block requests in flight per peer (currently 8).
    - [ ] Restore the experimentally validated 64-request window. A real-swarm run
      improved from roughly 2–3 MB/s to 7–10 MB/s; 128 requests added little over 64.
-   - [ ] Serialize every socket write through one owner/channel; current leecher,
-     seeder, and keepalive paths can write concurrently.
-   - [ ] Make write failures terminate the connection and release claimed work.
+   - [x] Confirm socket-write serialization is unnecessary for the current design:
+     Go permits concurrent `net.Conn` writes and every wire message is emitted by one
+     `Write`, so leecher, seeder, and keepalive frames remain intact.
+   - [ ] Stabilization: propagate send failures to `PeerConnection`, terminate the
+     connection, and release claimed work. Deliberately defer this until the larger
+     protocol mechanisms are complete.
    - [ ] Later optimization: let one connection pipeline blocks across two or more
      pieces so its request window does not drain at every piece boundary. Do not
      block the first functional GUI on this.
@@ -300,7 +303,9 @@ commandChan) lives at that seam.
 - The rarest-first ranking is still disconnected from `PieceManager.GetWork`, which
   claims the first available piece by index.
 - “Zero speed” eviction treats healthy-but-choked/useful peers as stalled.
-- Socket writes remain unsynchronized across leecher, seeder, and keepalive paths.
+- Concurrent socket writes are safe with the current one-buffer/one-`Write` message
+  encoding. The remaining debt is ignored send failures and delayed connection/claim
+  cleanup, intentionally deferred to stabilization.
 - The current reverted baseline passes `go test ./...`; preserve that while fixing
   the lifecycle issues above.
 

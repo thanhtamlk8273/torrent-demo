@@ -10,21 +10,27 @@ import (
 	"torrent-demo/internal/peer"
 )
 
-type PieceState uint8
+type pieceState uint8
 
 const (
-	Unclaimed PieceState = iota
+	Unclaimed pieceState = iota
 	Claimed
 	Done
 )
 
+type rankedPiece struct {
+	idx   int
+	count int
+}
+
 type PieceManager struct {
 	mu            sync.RWMutex
 	location      string
-	pieceStates   []PieceState
+	pieceStates   []pieceState
 	metaInfo      metainfo.MetaInfo
 	layout        *TorrentLayout
 	localBitfield peer.Bitfield
+	rankedPieces  []rankedPiece
 }
 
 func NewPieceManager(location string, mInfo metainfo.MetaInfo) (*PieceManager, error) {
@@ -35,7 +41,7 @@ func NewPieceManager(location string, mInfo metainfo.MetaInfo) (*PieceManager, e
 	pm := &PieceManager{
 		mu:          sync.RWMutex{},
 		location:    location,
-		pieceStates: make([]PieceState, layout.piecesCount),
+		pieceStates: make([]pieceState, layout.piecesCount),
 		metaInfo:    mInfo,
 		layout:      layout,
 	}
@@ -47,7 +53,9 @@ func NewPieceManager(location string, mInfo metainfo.MetaInfo) (*PieceManager, e
 	for idx := range pm.pieceStates {
 		if field.Has(idx) {
 			pm.pieceStates[idx] = Done
+			continue
 		}
+		pm.rankedPieces = append(pm.rankedPieces, rankedPiece{idx: idx})
 	}
 	pm.localBitfield = field
 
@@ -64,8 +72,8 @@ func (pm *PieceManager) GetWork(field peer.Bitfield) (peer.PieceWork, bool) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	pieceCount := pm.layout.piecesCount
-	for idx := range pieceCount {
+	for _, rankedPiece := range pm.rankedPieces {
+		idx := rankedPiece.idx
 		if pm.pieceStates[idx] == Unclaimed && field.Has(idx) {
 			expected, ok := getHash(pm.metaInfo.Info.Common().Pieces, idx)
 			if !ok {
@@ -134,6 +142,31 @@ func (pm *PieceManager) Progress() (done, total int) {
 	return done, len(pm.pieceStates)
 }
 
+func (pm *PieceManager) SubmitAvailability(availability []int) []int {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	ranked := []rankedPiece{}
+	for idx, count := range availability {
+		if pm.pieceStates[idx] != Done {
+			ranked = append(ranked, rankedPiece{idx, count})
+		}
+	}
+	slices.SortFunc(ranked, func(a, b rankedPiece) int {
+		return a.count - b.count // ascending: rarest first
+	})
+
+	pm.rankedPieces = ranked
+
+	indices := make([]int, 0)
+	for _, r := range ranked {
+		if r.count > 0 {
+			indices = append(indices, r.idx)
+		}
+	}
+	return indices
+}
+
 func (pm *PieceManager) verifyTorrent() (peer.Bitfield, error) {
 	pieceCount := int(pm.layout.piecesCount)
 	field := peer.NewBitfield(nil, pieceCount)
@@ -154,31 +187,6 @@ func (pm *PieceManager) verifyTorrent() (peer.Bitfield, error) {
 		field.Set(int(idx))
 	}
 	return *field, nil
-}
-
-func (pm *PieceManager) GetNextPieces(availability []int) []int {
-	ranked := []struct {
-		idx   int
-		count int
-	}{}
-	for idx, count := range availability {
-		if pm.pieceStates[idx] == Unclaimed {
-			ranked = append(ranked, struct {
-				idx   int
-				count int
-			}{idx, count})
-		}
-	}
-	slices.SortFunc(ranked, func(a, b struct{ idx, count int }) int {
-		return a.count - b.count // ascending: rarest first
-	})
-	indices := make([]int, 0)
-	for _, r := range ranked {
-		if r.count > 0 {
-			indices = append(indices, r.idx)
-		}
-	}
-	return indices
 }
 
 func getHash(pieces []byte, idx int) ([20]byte, bool) {
