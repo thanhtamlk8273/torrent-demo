@@ -1,0 +1,385 @@
+:root {
+    --bg: #1b2632;
+    --bg-panel: #232f3e;
+    --bg-row: #2a3748;
+    --bg-row-hover: #324155;
+    --border: #3a4a5e;
+    --text: #e6edf3;
+    --text-dim: #93a4b5;
+    --accent: #4f9cf9;
+    --green: #3fb96b;
+    --yellow: #d9a13b;
+    --red: #d95b4f;
+    --gray: #7d8ea0;
+
+    /* Design tokens */
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --radius-sm: 6px;
+    --radius-md: 10px;
+    --radius-lg: 14px;
+    --accent-rgb: 79, 156, 249;
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, .25);
+    --shadow-md: 0 4px 12px rgba(0, 0, 0, .35);
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html, body, #root {
+    height: 100%;
+    margin: 0;
+}
+
+body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    font-size: 14px;
+}
+
+#App {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    padding: var(--space-3);
+    gap: 10px;
+}
+
+.mono {
+    font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+    font-size: 12px;
+}
+
+/* Toolbar: Add / Start / Stop / Remove acting on the selected row */
+.toolbar {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) 10px;
+    background: var(--bg-panel);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-sm);
+}
+
+.toolbar-button {
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: var(--space-1) var(--space-3);
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.toolbar-button:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.toolbar-button:disabled {
+    opacity: .45;
+    cursor: default;
+}
+
+.header-stats {
+    margin-left: auto;
+    color: var(--text-dim);
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.error-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    background: rgba(217, 91, 79, 0.15);
+    border: 1px solid var(--red);
+    color: #ffb3ab;
+    border-radius: var(--radius-sm);
+    padding: var(--space-1) 10px;
+}
+
+.error-banner button {
+    background: none;
+    border: none;
+    color: inherit;
+    font-size: 16px;
+    cursor: pointer;
+}
+
+.empty-hint {
+    color: var(--text-dim);
+    padding: var(--space-3) var(--space-1);
+}
+
+/* Stacked layout: session table on top, detail panel below */
+.main-layout {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    gap: 10px;
+}
+
+.table-panel {
+    flex: 1 1 60%;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+.detail-panel {
+    flex: 1 1 40%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Session table */
+.session-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.session-table thead th {
+    position: sticky;
+    top: 0;
+    background: var(--bg-panel);
+    color: var(--text-dim);
+    font-size: 12px;
+    font-weight: 600;
+    text-align: left;
+    padding: var(--space-1) 10px;
+    border-bottom: 1px solid var(--border);
+    z-index: 1;
+}
+
+.session-table tbody tr {
+    cursor: pointer;
+    border-bottom: 1px solid var(--border);
+}
+
+.session-table tbody tr:hover {
+    background: var(--bg-row-hover);
+}
+
+.session-table tbody tr.selected {
+    background: rgba(var(--accent-rgb), .18);
+}
+
+.session-table td {
+    padding: var(--space-1) 10px;
+    white-space: nowrap;
+}
+
+.session-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 260px;
+}
+
+/* Progress bar with the percentage printed on top */
+.progress-cell {
+    position: relative;
+    width: 140px;
+}
+
+.progress-cell .progress-track {
+    height: 16px;
+    background: var(--bg);
+    border-radius: var(--radius-sm);
+    overflow: hidden;
+}
+
+.progress-cell .progress-fill {
+    height: 100%;
+    background: var(--green);
+    transition: width 0.4s ease;
+}
+
+.progress-cell .progress-label {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    color: #fff;
+    text-shadow: 0 1px 1px rgba(0, 0, 0, .4);
+}
+
+/* Status as plain colored text (all five distinct) */
+.status-pending { color: var(--yellow); }
+.status-running { color: var(--accent); }
+.status-stopped { color: var(--gray); }
+.status-completed { color: var(--green); }
+.status-errored { color: var(--red); }
+
+/* Detail panel */
+.session-detail {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 10px var(--space-3);
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+    overflow: hidden;
+    box-shadow: var(--shadow-sm);
+}
+
+.detail-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+}
+
+.session-detail h2 {
+    font-size: 14px;
+    margin: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.tab-bar {
+    display: flex;
+    gap: 2px;
+    padding: 2px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    flex-shrink: 0;
+}
+
+.tab {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: var(--text-dim);
+    padding: var(--space-1) var(--space-3);
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.tab:hover {
+    color: var(--text);
+}
+
+.tab.active {
+    background: rgba(var(--accent-rgb), .18);
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.tab-glyph {
+    font-size: 13px;
+    line-height: 1;
+    opacity: .9;
+}
+
+.peer-table {
+    width: 100%;
+    border-collapse: collapse;
+    overflow-y: auto;
+    display: block;
+    flex: 1;
+    min-height: 0;
+}
+
+.peer-table th, .peer-table td {
+    text-align: left;
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--border);
+}
+
+.peer-table th {
+    color: var(--text-dim);
+    font-weight: 600;
+    font-size: 12px;
+    position: sticky;
+    top: 0;
+    background: var(--bg-panel);
+}
+
+/* General tab: dense labeled grid, qBittorrent style */
+.general-tab {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+}
+
+.info-section {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: var(--space-2) var(--space-3);
+}
+
+.section-title {
+    margin: 0 0 var(--space-2);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: .04em;
+}
+
+.general-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    column-gap: var(--space-4);
+    row-gap: var(--space-1);
+}
+
+.field {
+    display: flex;
+    gap: var(--space-2);
+    min-width: 0;
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.field.wide {
+    grid-column: 1 / -1;
+}
+
+.field-label {
+    flex: 0 0 96px;
+    color: var(--text-dim);
+}
+
+.field-value {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.field-value.wrap {
+    white-space: normal;
+    word-break: break-all;
+}
+
+.field-error {
+    color: var(--red);
+}
+
+@media (max-width: 860px) {
+    .general-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}

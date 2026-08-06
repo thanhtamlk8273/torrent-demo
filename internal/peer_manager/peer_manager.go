@@ -16,6 +16,10 @@ const (
 	kRetryAgainAfter   = 1 * time.Minute
 	kRevisitTime       = 2 * time.Minute
 	kBitfieldStaleTime = 5 * time.Minute
+
+	// MaxParallelPeers is the exported alias the GUI uses for the
+	// "n (100 max)" connections display. Do not rename kMaxParallelPeers.
+	MaxParallelPeers = kMaxParallelPeers
 )
 
 type Status string
@@ -47,23 +51,45 @@ type activePeer struct {
 	lastUploadedBytes   uint64
 }
 
+// PeerSnapshot is a point-in-time view of a single known peer, for the GUI's
+// peer table. Plain data only — no handles into the live connection.
+type PeerSnapshot struct {
+	Tag              string
+	Active           bool
+	Address          string
+	DownloadedBytes  uint64
+	UploadedBytes    uint64
+	BitfieldFraction float64
+}
+
 type PeerManager struct {
 	infoHash [20]byte
 	peerID   [20]byte
 
+	// mu guards waiting/active. Lock ONLY at the three true entry points:
+	// AddPeer, Run's own tick-handling (the activeFirstBatch call and the
+	// evictStallPeers/fillActiveSlots tick case), and Snapshot. Never inside
+	// activate/markFailed/fillActiveSlots/selectCandidates/pieceAvailability/
+	// evictStallPeers/identifyEvictTargets/evict — those nest up to three
+	// levels deep under Run and deadlock on the very next call if locked.
+	mu      sync.Mutex
 	waiting map[string]waitingPeer
 	active  map[string]activePeer
 
+	// retiredDown/retiredUp accumulate lifetime byte totals of peers that were
+	// evicted. delete(pm.active, ...) happens at exactly one place (evict), so
+	// "a peer leaves active only through evict" holds: retired rises by exactly
+	// what the active sum drops, making TotalTransferred exact and monotonic.
+	// Guarded by mu like everything else in these maps.
+	retiredDown, retiredUp uint64
+
 	scheduler peer.PieceScheduler
 	book      peer.PieceBook
-	reporter  peer.Reporter
 }
 
 func (pm *PeerManager) logf(format string, args ...any) {
 	log.Printf("[PeerManager] "+format, args...)
 }
-
-func (pm *PeerManager) SetReporter(r peer.Reporter) { pm.reporter = r }
 
 func NewPeerManager(infoHash [20]byte, peerId [20]byte, scheduler peer.PieceScheduler, book peer.PieceBook) *PeerManager {
 	return &PeerManager{
@@ -77,6 +103,8 @@ func NewPeerManager(infoHash [20]byte, peerId [20]byte, scheduler peer.PieceSche
 }
 
 func (pm *PeerManager) AddPeer(p tracker_client.Peer) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
 	tag := fmt.Sprintf("tcp://%s:%d", p.Ip, p.Port)
 	if _, ok := pm.waiting[tag]; ok {
 		pm.logf("stage=peer-discovery-ignored peer=%s reason=already-waiting", tag)
@@ -96,7 +124,7 @@ func (pm *PeerManager) AddPeer(p tracker_client.Peer) {
 		},
 	}
 	pm.waiting[tag] = mp
-	fmt.Printf("[PeerManager] AddPeer %s (total=%d)\n", tag, len(pm.waiting)+len(pm.active))
+	pm.logf("AddPeer %s (total=%d)", tag, len(pm.waiting)+len(pm.active))
 }
 
 func (pm *PeerManager) Run(ctx context.Context) error {
@@ -104,7 +132,10 @@ func (pm *PeerManager) Run(ctx context.Context) error {
 	pm.logf("stage=starting waiting=%d active=%d capacity=%d", len(pm.waiting), len(pm.active), kMaxParallelPeers)
 
 	// Add first batch of active peers randomly
-	if ok := pm.activeFirstBatch(ctx); !ok {
+	pm.mu.Lock()
+	ok := pm.activeFirstBatch(ctx)
+	pm.mu.Unlock()
+	if !ok {
 		pm.logf("stage=initial-activation-failed waiting=%d active=%d", len(pm.waiting), len(pm.active))
 		return fmt.Errorf("Unable to start first batch of peers")
 	}
@@ -120,8 +151,10 @@ func (pm *PeerManager) Run(ctx context.Context) error {
 			wg.Wait()
 			return ctx.Err()
 		case <-ticker.C:
+			pm.mu.Lock()
 			pm.evictStallPeers()
 			pm.fillActiveSlots(ctx)
+			pm.mu.Unlock()
 		}
 	}
 }
@@ -156,9 +189,6 @@ func (pm *PeerManager) activate(ctx context.Context, tag string) bool {
 		pm.logf("stage=activation-failed peer=%s", tag)
 		pm.markFailed(tag)
 		return false
-	}
-	if pm.reporter != nil {
-		pc.SetReporter(pm.reporter)
 	}
 	pc.Run()
 	pm.active[tag] = activePeer{
@@ -311,6 +341,61 @@ func (pm *PeerManager) identifyEvictTargets() []string {
 	return targets
 }
 
+// Snapshot returns a point-in-time view of every known peer, for the GUI's
+// peer table. Safe to call from any goroutine; never blocks on Run's loop.
+func (pm *PeerManager) Snapshot() []PeerSnapshot {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	out := make([]PeerSnapshot, 0, len(pm.active)+len(pm.waiting))
+	for tag, ap := range pm.active {
+		bf := ap.conn.GetBitField()
+		out = append(out, PeerSnapshot{
+			Tag:              tag,
+			Active:           true,
+			Address:          fmt.Sprintf("%s:%d", ap.profile.endpoint.Ip, ap.profile.endpoint.Port),
+			DownloadedBytes:  ap.conn.GetDownloadedBytes(),
+			UploadedBytes:    ap.conn.GetUploadedBytes(),
+			BitfieldFraction: bitfieldFraction(bf),
+		})
+	}
+	for tag, wp := range pm.waiting {
+		out = append(out, PeerSnapshot{
+			Tag:              tag,
+			Active:           false,
+			Address:          fmt.Sprintf("%s:%d", wp.profile.endpoint.Ip, wp.profile.endpoint.Port),
+			BitfieldFraction: bitfieldFraction(wp.profile.lastBitfield),
+		})
+	}
+	return out
+}
+
+// TotalTransferred returns lifetime bytes for this torrent: bytes still held by
+// live connections plus bytes retired by evicted ones. Safe from any goroutine.
+// It locks mu, iterates active, and calls no other PeerManager method — the
+// same leaf-entry-point shape as Snapshot, so it cannot deadlock against Run.
+func (pm *PeerManager) TotalTransferred() (down, up uint64) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	for _, ap := range pm.active {
+		down += ap.conn.GetDownloadedBytes()
+		up += ap.conn.GetUploadedBytes()
+	}
+	return down + pm.retiredDown, up + pm.retiredUp
+}
+
+func bitfieldFraction(bf peer.Bitfield) float64 {
+	if bf.Size() == 0 {
+		return 0
+	}
+	have := 0
+	for i := range bf.Size() {
+		if bf.Has(i) {
+			have++
+		}
+	}
+	return float64(have) / float64(bf.Size())
+}
+
 func (pm *PeerManager) evict(tag string) {
 	activePeer, ok := pm.active[tag]
 	if !ok {
@@ -327,6 +412,11 @@ func (pm *PeerManager) evict(tag string) {
 		eligibleAt: time.Now().Add(kRetryAgainAfter),
 	}
 	pm.waiting[tag] = waitingPeer
+	// Retire this peer's lifetime bytes before it leaves active, so the total
+	// stays exact. evict() always runs under pm.mu (called from evictStallPeers
+	// <- Run's tick case, which locks), so no additional synchronization.
+	pm.retiredDown += activePeer.conn.GetDownloadedBytes()
+	pm.retiredUp += activePeer.conn.GetUploadedBytes()
 	delete(pm.active, tag)
 	pm.logf("stage=evicted peer=%s waiting=%d active=%d eligible-at=%s", tag, len(pm.waiting), len(pm.active), waitingPeer.eligibleAt.Format(time.RFC3339))
 }

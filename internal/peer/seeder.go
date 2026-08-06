@@ -20,7 +20,6 @@ type Seeder struct {
 	uploadedBytes uint64
 
 	scheduler PieceScheduler
-	reporter  Reporter
 }
 
 func (s *Seeder) logf(format string, args ...any) {
@@ -87,9 +86,6 @@ func (l *Seeder) processMessage(msg message.Message) {
 		}
 		atomic.AddUint64(&l.uploadedBytes, uint64(len(requestedBlock)))
 		l.logf("stage=piece-sent piece=%d begin=%d length=%d", m.Index, m.Begin, len(requestedBlock))
-		if l.reporter != nil { // debug-only
-			l.reporter.BlockSent(l.conn.RemoteAddr().String(), len(requestedBlock))
-		}
 	}
 }
 

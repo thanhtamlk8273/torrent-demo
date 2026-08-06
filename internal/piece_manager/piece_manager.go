@@ -92,18 +92,20 @@ func (pm *PieceManager) GetWork(field peer.Bitfield) (peer.PieceWork, bool) {
 }
 
 func (pm *PieceManager) CompletePiece(index int, data []byte) error {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
 	if err := pm.layout.writePiece(index, data); err != nil {
 		// A failed write must never count as Done. Revert a claimed piece so
 		// it can be re-fetched; leave any other state untouched.
+		pm.mu.Lock()
 		if pm.pieceStates[index] == Claimed {
 			pm.pieceStates[index] = Unclaimed
 		}
+		pm.mu.Unlock()
 		return err
 	}
+	pm.mu.Lock()
 	pm.pieceStates[index] = Done
 	pm.localBitfield.Set(index)
+	pm.mu.Unlock()
 	return nil
 }
 
@@ -116,9 +118,10 @@ func (pm *PieceManager) UnclaimPiece(index int) {
 }
 
 func (pm *PieceManager) GetBlock(index, begin, length int) ([]byte, error) {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-	if pm.pieceStates[index] != Done {
+	pm.mu.RLock()
+	done := pm.pieceStates[index] == Done
+	pm.mu.RUnlock()
+	if !done {
 		return []byte{}, fmt.Errorf("Do not have requested piece %d", index)
 	}
 	piece, err := pm.layout.readPiece(index)

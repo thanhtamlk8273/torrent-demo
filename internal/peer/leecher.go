@@ -2,7 +2,6 @@ package peer
 
 import (
 	"crypto/sha1"
-	"fmt"
 	"net"
 	"sync/atomic"
 	"torrent-demo/internal/message"
@@ -27,7 +26,6 @@ type Leecher struct {
 	downloadedBytes uint64
 
 	scheduler PieceScheduler
-	reporter  Reporter
 }
 
 func (l *Leecher) init() {
@@ -42,9 +40,6 @@ func (l *Leecher) advance() {
 				panic("p.currentPiece should be NULL when new work comes")
 			}
 			l.currentPiece = newPiece(w)
-			if l.reporter != nil { // debug-only
-				l.reporter.PieceStarted(l.conn.RemoteAddr().String(), w.Index, len(l.currentPiece.blocks))
-			}
 		}
 	}
 	if !l.isChoking {
@@ -74,23 +69,14 @@ func (l *Leecher) processMessage(msg message.Message) {
 				// stale block for a piece we've moved on from; dropped silently
 			} else if l.currentPiece.saveBlock(m.Begin, m.Block) {
 				atomic.AddUint64(&l.downloadedBytes, uint64(len(m.Block)))
-				if l.reporter != nil { // debug-only
-					l.reporter.BlockSaved(l.conn.RemoteAddr().String(), int(m.Begin)/kBlockSize, len(m.Block))
-				}
 			}
 			if l.currentPiece.complete() {
 				data := l.currentPiece.assemble()
 				hash := sha1.Sum(data)
 				if hash != l.currentPiece.expectedHash {
-					if l.reporter != nil { // debug-only
-						l.reporter.PieceFailed(l.conn.RemoteAddr().String(), fmt.Sprintf("piece %d hash mismatch", l.currentPiece.index))
-					}
 					l.scheduler.UnclaimPiece(l.currentPiece.index)
 				} else {
 					l.scheduler.CompletePiece(l.currentPiece.index, data)
-					if l.reporter != nil { // debug-only
-						l.reporter.PieceCompleted(l.conn.RemoteAddr().String(), l.currentPiece.index)
-					}
 				}
 				l.currentPiece = nil
 				l.nextIdx = 0
@@ -121,9 +107,6 @@ func (l *Leecher) requestNextChunk() bool {
 
 func (l *Leecher) shutdown() {
 	if l.currentPiece != nil {
-		if l.reporter != nil { // debug-only
-			l.reporter.PieceFailed(l.conn.RemoteAddr().String(), fmt.Sprintf("piece %d incomplete", l.currentPiece.index))
-		}
 		l.scheduler.UnclaimPiece(l.currentPiece.index)
 		l.currentPiece = nil
 	}

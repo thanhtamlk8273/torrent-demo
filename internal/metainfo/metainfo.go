@@ -12,6 +12,9 @@ type MetaInfo struct {
 	InfoHash     [20]byte
 	Announce     string     `bencode:"announce"`
 	AnnounceList [][]string `bencode:"announce-list"`
+	Comment      string     `bencode:"comment"`
+	CreatedBy    string     `bencode:"created by"`
+	CreationDate int        `bencode:"creation date"`
 }
 
 type Info interface {
@@ -26,6 +29,7 @@ func (InfoField) isInfo() {}
 type InfoCommon struct {
 	PieceLength int    `bencode:"piece length"`
 	Pieces      []byte `bencode:"pieces"`
+	Private     int    `bencode:"private"`
 }
 
 type SingleFileInfo struct {

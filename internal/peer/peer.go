@@ -12,7 +12,7 @@ import (
 
 const (
 	kMessageChannelSize int = 64
-	kMaxParallelChunks      = 8
+	kMaxParallelChunks      = 64
 	kDialTimeout            = 5 * time.Second
 	kHandshakeTimeout       = 10 * time.Second
 	kLeecherStartDelay      = 2 * time.Second
@@ -58,18 +58,9 @@ type PeerConnection struct {
 	lastUpBytes   int64
 
 	commandChan chan PeerCommand
-	reporter    Reporter
 
 	leecherStartDelay time.Duration
 	stats             atomic.Pointer[PeerStats]
-}
-
-// SetReporter attaches a debug-only observer for this connection's lifecycle
-// signals. Not required for normal operation.
-func (p *PeerConnection) SetReporter(r Reporter) {
-	p.reporter = r
-	p.seeder.reporter = r
-	p.leecher.reporter = r
 }
 
 func (p *PeerConnection) logf(format string, args ...any) {
@@ -166,12 +157,6 @@ func (p *PeerConnection) Run() {
 			p.seeder.shutdown()
 			p.leecher.shutdown()
 		}()
-
-		addr := p.conn.RemoteAddr().String()
-		if p.reporter != nil { // debug-only
-			p.reporter.PeerConnected(addr)
-			defer func() { p.reporter.PeerDisconnected(addr, nil) }()
-		}
 
 		p.logf("stage=active")
 		go p.keepAliveLoop(p.ctx)

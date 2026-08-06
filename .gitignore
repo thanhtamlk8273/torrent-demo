@@ -68,6 +68,10 @@ wheels/
 share/python-wheels/
 *.egg-info/
 .installed.cfg
+
+# Frontend (Wails)
+frontend/node_modules/
+frontend/dist/
 *.egg
 MANIFEST
 

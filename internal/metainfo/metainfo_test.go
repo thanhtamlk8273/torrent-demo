@@ -59,6 +59,73 @@ func TestNewMetaInfo_InfoHash(t *testing.T) {
 	}
 }
 
+func TestNewMetaInfo_ExtendedFields(t *testing.T) {
+	meta, err := metainfo.NewMetaInfo("testdata/rdr.torrent")
+	if err != nil {
+		t.Fatalf("failed to parse: %v", err)
+	}
+
+	if meta.Comment != "http://rutor.is/torrent/780917" {
+		t.Errorf("comment = %q, want %q", meta.Comment, "http://rutor.is/torrent/780917")
+	}
+	if meta.CreatedBy != "Transmission/2.92 (14714)" {
+		t.Errorf("created by = %q, want %q", meta.CreatedBy, "Transmission/2.92 (14714)")
+	}
+	if meta.CreationDate != 1603364761 {
+		t.Errorf("creation date = %d, want %d", meta.CreationDate, 1603364761)
+	}
+
+	info, ok := meta.Info.Info.(metainfo.MultiFileInfo)
+	if !ok {
+		t.Fatal("expected multi-file torrent")
+	}
+	if info.Private != 0 {
+		t.Errorf("private = %d, want 0", info.Private)
+	}
+}
+
+// A torrent without created by / creation date / private keys must still
+// parse, leaving the zero values (bencode.fill skips missing keys). try.torrent
+// does carry a comment, which is why it is not asserted here.
+func TestNewMetaInfo_MissingExtendedKeys(t *testing.T) {
+	meta, err := metainfo.NewMetaInfo("testdata/try.torrent")
+	if err != nil {
+		t.Fatalf("failed to parse: %v", err)
+	}
+
+	if meta.CreatedBy != "" {
+		t.Errorf("created by = %q, want empty", meta.CreatedBy)
+	}
+	if meta.CreationDate != 0 {
+		t.Errorf("creation date = %d, want 0", meta.CreationDate)
+	}
+	if info := meta.Info.Info.Common(); info.Private != 0 {
+		t.Errorf("private = %d, want 0", info.Private)
+	}
+}
+
+// Positive path for the new private key: a private flag of 1 must round-trip.
+func TestInfoField_UnmarshalBencode_Private(t *testing.T) {
+	data := map[string]any{
+		"piece length": 512,
+		"pieces":       "xxxx",
+		"name":         "myfile.txt",
+		"length":       1024,
+		"private":      1,
+	}
+	var f metainfo.InfoField
+	if err := f.UnmarshalBencode(data); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	info, ok := f.Info.(metainfo.SingleFileInfo)
+	if !ok {
+		t.Fatalf("expected SingleFileInfo, got %T", f.Info)
+	}
+	if info.Private != 1 {
+		t.Errorf("private = %d, want 1", info.Private)
+	}
+}
+
 // --- InfoField.UnmarshalBencode ---
 
 func TestInfoField_UnmarshalBencode_SelectsSingleFile(t *testing.T) {
